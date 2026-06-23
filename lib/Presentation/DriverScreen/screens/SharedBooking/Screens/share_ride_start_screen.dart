@@ -1045,10 +1045,47 @@ class _ShareRideStartScreenState extends State<ShareRideStartScreen>
     socketService.on('driver-cancelled', (data) async {
       if (!Get.isRegistered<DriverMainController>()) return;
       await Get.find<DriverMainController>().handleDriverCancelled(data);
+      if (!mounted || _isDisposing) return;
+      final bookingId = data?['bookingId']?.toString();
+      if (bookingId == null || bookingId.isEmpty) return;
+
+      // If the parent booking is cancelled, exit to home.
+      if (bookingId == widget.bookingId) {
+        if (!Get.isRegistered<DriverMainController>()) return;
+        await Get.find<DriverMainController>().handleDriverCancelled(data);
+        return;
+      }
+
+      // Otherwise, just remove the specific rider from the pool.
+      final removedName = sharedRideController.removeRider(bookingId);
+      if (removedName != null) {
+        CustomSnackBar.showInfo('Ride for $removedName has been cancelled.');
+        if (sharedRideController.riders.isEmpty) {
+          await _exitToHomeSafely();
+        }
+      }
     });
     socketService.on('customer-cancelled', (data) async {
       if (!Get.isRegistered<DriverMainController>()) return;
       await Get.find<DriverMainController>().handleCustomerCancelled(data);
+      if (!mounted || _isDisposing) return;
+      final bookingId = data?['bookingId']?.toString();
+      if (bookingId == null || bookingId.isEmpty) return;
+
+      // If the parent booking is cancelled, exit to home.
+      if (bookingId == widget.bookingId) {
+        if (!Get.isRegistered<DriverMainController>()) return;
+        await Get.find<DriverMainController>().handleCustomerCancelled(data);
+        return;
+      }
+
+      final removedName = sharedRideController.removeRider(bookingId);
+      if (removedName != null) {
+        CustomSnackBar.showInfo('Ride for $removedName has been cancelled by the customer.');
+        if (sharedRideController.riders.isEmpty) {
+          await _exitToHomeSafely();
+        }
+      }
     });
 
     socketService.on('driver-reached-destination', (data) {

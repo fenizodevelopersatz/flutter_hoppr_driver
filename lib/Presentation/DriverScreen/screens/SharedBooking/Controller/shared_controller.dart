@@ -136,6 +136,67 @@ class SharedController extends GetxController {
       }
 
       if (data == null) return;
+      if (data is List) {
+        final bookings = <Map<String, dynamic>>[];
+        dynamic payload = data;
+        if (payload.length == 1) {
+          final first = payload.first;
+          if (first is Map || first is List) payload = first;
+        }
+        if (payload is Map) {
+          bookings.add(Map<String, dynamic>.from(payload));
+        } else if (payload is List) {
+          for (final e in payload) {
+            if (e is Map) bookings.add(Map<String, dynamic>.from(e));
+          }
+        }
+
+        if (bookings.isEmpty) return;
+        if (!Get.isRegistered<SharedRideController>()) {
+          CommonLogger.log.w('SharedRideController not registered (yet)');
+          return;
+        }
+
+        final sharedRide = Get.find<SharedRideController>();
+        for (final booking in bookings) {
+          final customerLoc = booking['customerLocation'];
+          if (customerLoc == null || customerLoc is! Map) {
+            CommonLogger.log.w('joined-booking without customerLocation');
+            continue;
+          }
+
+          final fromLat = (customerLoc['fromLatitude'] as num).toDouble();
+          final fromLng = (customerLoc['fromLongitude'] as num).toDouble();
+          final toLat = (customerLoc['toLatitude'] as num).toDouble();
+          final toLng = (customerLoc['toLongitude'] as num).toDouble();
+
+          final pickupAddr =
+              (booking['pickupLocationAddress'] ?? booking['pickupAddress'] ?? '')
+                  .toString()
+                  .trim();
+          final dropoffAddr =
+              (booking['dropLocationAddress'] ??
+                      booking['dropoffAddress'] ??
+                      booking['dropAddress'] ??
+                      '')
+                  .toString()
+                  .trim();
+
+          final normalized = Map<String, dynamic>.from(booking);
+          normalized['pickupAddress'] = pickupAddr.isNotEmpty
+              ? pickupAddr
+              : await _getAddressFromLatLng(fromLat, fromLng);
+          normalized['dropoffAddress'] = dropoffAddr.isNotEmpty
+              ? dropoffAddr
+              : await _getAddressFromLatLng(toLat, toLng);
+
+          await sharedRide.upsertFromSocket(normalized);
+        }
+        CommonLogger.log.i(
+          '${bookings.length} rider(s) upserted into SharedRideController',
+        );
+        return;
+      }
 
       final customerLoc = data['customerLocation'];
       if (customerLoc == null) {

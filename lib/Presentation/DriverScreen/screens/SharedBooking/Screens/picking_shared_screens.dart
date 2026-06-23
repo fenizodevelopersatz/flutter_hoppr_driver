@@ -918,6 +918,7 @@ class _PickingCustomerSharedScreenState
     LatLng dest, {
     required String label,
     required String source,
+    SharedRiderItem? rider,
   }) async {
     final ok = await _navigationService.requestPermissions();
     if (!ok) {
@@ -969,9 +970,14 @@ class _PickingCustomerSharedScreenState
       await Get.find<DriverMainController>().onAppPaused();
     }
 
+    final trackingBookingId = (rider?.bookingId ?? widget.bookingId).trim();
+    if (rider != null) {
+      await c.selectRider(rider);
+    }
+
     await DriverBackgroundLocationService.startTracking(
       socketUrl: socketUrl,
-      rideId: widget.bookingId,
+      rideId: trackingBookingId.isNotEmpty ? trackingBookingId : widget.bookingId,
       driverId: driverId,
     );
     _backgroundServiceActive = true;
@@ -1004,6 +1010,7 @@ class _PickingCustomerSharedScreenState
                 rider.pickupLatLng,
                 label: 'Pickup - ${rider.name}',
                 source: 'shared_pickup_google_maps',
+                rider: rider,
               ),
             ),
             const SizedBox(height: 10),
@@ -1142,7 +1149,7 @@ class _PickingCustomerSharedScreenState
           handleColor: _C.green,
           handleIconColor: Colors.white,
           borderRadius: BorderRadius.circular(15),
-          text: 'Swipe to Start - ${rider.name}',
+          text: 'Swipe to Start - ${rider.firstName}',
           textStyle: TextStyle(
             fontSize: 13,
             fontWeight: FontWeight.w600,
@@ -1512,43 +1519,113 @@ class _PickingCustomerSharedScreenState
                       physics: const BouncingScrollPhysics(),
                       padding: const EdgeInsets.only(bottom: 16),
                       children: [
-                        if (sharedRideController.riders.isEmpty)
-                          Padding(
-                            padding: const EdgeInsets.symmetric(
-                              vertical: 36,
-                              horizontal: 24,
-                            ),
-                            child: Column(
-                              children: [
-                                Icon(
-                                  Icons.sensors_rounded,
-                                  color: _C.textMuted,
-                                  size: 36,
-                                ),
-                                const SizedBox(height: 12),
-                                const Text(
-                                  'Waiting for shared ride requests…',
-                                  style: TextStyle(
-                                    fontSize: 14,
-                                    color: _C.textSub,
-                                    fontWeight: FontWeight.w500,
+                        Obx(() {
+                          // ✅ Show ALL active riders (not filtered by single booking)
+                          final allActiveRiders =
+                              sharedRideController.getAllActiveRiders();
+
+                          // Separate by stage for better UX
+                          final waitingRiders = allActiveRiders
+                              .where((r) => r.stage == SharedRiderStage.waitingPickup)
+                              .toList();
+                          final onboardRiders = allActiveRiders
+                              .where((r) => r.stage == SharedRiderStage.onboardDrop)
+                              .toList();
+
+                          if (allActiveRiders.isEmpty)
+                            return Padding(
+                              padding: const EdgeInsets.symmetric(
+                                vertical: 36,
+                                horizontal: 24,
+                              ),
+                              child: Column(
+                                children: [
+                                  Icon(
+                                    Icons.sensors_rounded,
+                                    color: _C.textMuted,
+                                    size: 36,
                                   ),
-                                  textAlign: TextAlign.center,
+                                  const SizedBox(height: 12),
+                                  const Text(
+                                    'Waiting for shared ride requests…',
+                                    style: TextStyle(
+                                      fontSize: 14,
+                                      color: _C.textSub,
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                    textAlign: TextAlign.center,
+                                  ),
+                                ],
+                              ),
+                            );
+
+                          return Column(
+                            children: [
+                              // 📍 Show waiting riders first
+                              if (waitingRiders.isNotEmpty) ...[
+                                Padding(
+                                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+                                  child: Row(
+                                    children: [
+                                      Icon(Icons.schedule, size: 16, color: _C.textMuted),
+                                      const SizedBox(width: 6),
+                                      Text(
+                                        'WAITING FOR PICKUP (${waitingRiders.length})',
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w700,
+                                          color: _C.textMuted,
+                                          letterSpacing: 0.5,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
                                 ),
+                                ...waitingRiders.map((rider) {
+                                  final activeR =
+                                      sharedRideController.activeTarget.value;
+                                  final isActive =
+                                      activeR != null &&
+                                      activeR.bookingId == rider.bookingId;
+                                  return _buildRiderCard(rider, isActive: isActive);
+                                }),
                               ],
-                            ),
-                          )
-                        else
-                          ...sharedRideController.riders.map((rider) {
-                            final activeR =
-                                sharedRideController.activeTarget.value;
-                            final isActive =
-                                activeR != null &&
-                                activeR.bookingId == rider.bookingId;
-                            return _buildRiderCard(rider, isActive: isActive);
-                          }),
-                        if (sharedRideController.riders.isNotEmpty)
-                          _buildBottomActions(),
+
+                              // 🚗 Show onboard riders
+                              if (onboardRiders.isNotEmpty) ...[
+                                Padding(
+                                  padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+                                  child: Row(
+                                    children: [
+                                      Icon(Icons.local_taxi, size: 16, color: _C.green),
+                                      const SizedBox(width: 6),
+                                      Text(
+                                        'ONBOARD (${onboardRiders.length})',
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w700,
+                                          color: _C.green,
+                                          letterSpacing: 0.5,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                ...onboardRiders.map((rider) {
+                                  final activeR =
+                                      sharedRideController.activeTarget.value;
+                                  final isActive =
+                                      activeR != null &&
+                                      activeR.bookingId == rider.bookingId;
+                                  return _buildRiderCard(rider, isActive: isActive);
+                                }),
+                              ],
+
+                              if (allActiveRiders.isNotEmpty)
+                                _buildBottomActions(),
+                            ],
+                          );
+                        }),
                       ],
                     ),
                   ),
@@ -1572,9 +1649,10 @@ class _PickingCustomerSharedScreenState
           body: Obx(() {
             final uiState = c.routeUi.value;
             final activeTarget = sharedRideController.activeTarget.value;
-            final initialBookingRider = sharedRideController.riders
-                .firstWhereOrNull((r) => r.bookingId == widget.bookingId);
-            final resolvedTarget = activeTarget ?? initialBookingRider;
+
+            // ✅ Use ALL active riders (shared pool may have multiple booking IDs)
+            final allRiders = sharedRideController.getAllActiveRiders();
+            final resolvedTarget = activeTarget ?? allRiders.firstOrNull;
             final rawTarget =
                 resolvedTarget == null
                     ? widget.pickupLocation

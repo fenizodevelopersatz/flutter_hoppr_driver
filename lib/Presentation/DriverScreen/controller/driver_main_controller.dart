@@ -2159,9 +2159,21 @@ class DriverMainController extends GetxController
       }
       final sharedRide = Get.find<SharedRideController>();
 
-      // Reset so stale riders from previous sessions don't block UI on resume.
-      sharedRide.riders.clear();
-      sharedRide.activeTarget.value = null;
+      // When returning from external navigation, the active-booking API may only
+      // return the single rider being navigated to. To prevent data loss, we
+      // preserve the existing list of riders if a shared pool is already active.
+      final hadActiveSharedPool = sharedRide.riders.any(
+        (r) => r.stage != SharedRiderStage.dropped,
+      );
+      final previousActiveBookingId =
+          sharedRide.activeTarget.value?.bookingId.trim() ?? '';
+
+      // If a shared ride is NOT already in progress, clear the list to start fresh.
+      // This handles cases where a new shared ride is being initiated.
+      if (!hadActiveSharedPool) {
+        sharedRide.riders.clear();
+        sharedRide.activeTarget.value = null;
+      }
 
       if (latD != null && lngD != null) {
         sharedRide.driverLocation.value = LatLng(latD, lngD);
@@ -2217,6 +2229,14 @@ class DriverMainController extends GetxController
         } else if (rideStarted) {
           sharedRide.markOnboard(bid);
         }
+      }
+
+      if (hadActiveSharedPool &&
+          previousActiveBookingId.isNotEmpty &&
+          sharedRide.riders.any((r) => r.bookingId == previousActiveBookingId)) {
+        sharedRide.activeTarget.value = sharedRide.riders.firstWhereOrNull(
+          (r) => r.bookingId == previousActiveBookingId,
+        );
       }
     } catch (_) {
       // best-effort only; socket joined-booking will still hydrate in most cases

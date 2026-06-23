@@ -3,6 +3,7 @@ import 'package:geocoding/geocoding.dart';
 import 'package:get/get.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:hopper/Core/Services/log_manager.dart';
 
 enum SharedRiderStage {
   waitingPickup, // not in car yet
@@ -46,6 +47,11 @@ class SharedRiderItem {
     this.stage = SharedRiderStage.waitingPickup,
     ActionSliderController? sliderController,
   }) : sliderController = sliderController ?? ActionSliderController();
+
+  String get firstName {
+    final parts = name.trim().split(' ');
+    return parts.isNotEmpty && parts[0].isNotEmpty ? parts[0] : 'Guest';
+  }
 }
 
 class SharedRideController extends GetxController {
@@ -159,6 +165,18 @@ class SharedRideController extends GetxController {
         ..amount = amount;
 
       riders.refresh();
+
+      // 📊 Log rider update
+      logManager.logRider(
+        action: 'RIDER_UPDATED',
+        bookingId: bookingIdStr,
+        riderData: {
+          'name': customerName,
+          'phone': customerPhone,
+          'pickup': pickupAddrs,
+          'dropoff': dropoffAddrs,
+        },
+      );
     } else {
       final newRider = SharedRiderItem(
         bookingId: bookingIdStr,
@@ -174,6 +192,18 @@ class SharedRideController extends GetxController {
 
       riders.add(newRider);
 
+      // 📊 Log new rider added
+      logManager.logRider(
+        action: 'RIDER_ADDED',
+        bookingId: bookingIdStr,
+        riderData: {
+          'name': customerName,
+          'totalRiders': riders.length,
+          'pickup': pickupAddrs,
+          'dropoff': dropoffAddrs,
+        },
+      );
+
       // ✅ if nothing active yet, make first rider active pickup
       activeTarget.value ??= newRider;
     }
@@ -185,9 +215,17 @@ class SharedRideController extends GetxController {
   void markArrived(String bookingId) {
     final idx = riders.indexWhere((r) => r.bookingId == bookingId);
     if (idx == -1) return;
+
     riders[idx].arrived = true;
     riders.refresh();
     _recomputeRadiusGates(driverLocation.value);
+
+    // 📊 Log arrival
+    logManager.logRider(
+      action: 'RIDER_ARRIVED',
+      bookingId: bookingId,
+      riderData: {'name': riders[idx].name},
+    );
   }
 
   void markOnboard(String bookingId) {
@@ -200,11 +238,23 @@ class SharedRideController extends GetxController {
     activeTarget.value = riders[idx];
     riders.refresh();
     _recomputeRadiusGates(driverLocation.value);
+
+    // 📊 Log onboard
+    logManager.logRider(
+      action: 'RIDER_ONBOARD',
+      bookingId: bookingId,
+      riderData: {
+        'name': riders[idx].name,
+        'dropoff': riders[idx].dropoffAddress,
+      },
+    );
   }
 
   void markDropped(String bookingId) {
     final idx = riders.indexWhere((r) => r.bookingId == bookingId);
     if (idx == -1) return;
+
+    final riderName = riders[idx].name;
 
     riders[idx].stage = SharedRiderStage.dropped;
     riders[idx].secondsLeft = 0;
@@ -216,6 +266,16 @@ class SharedRideController extends GetxController {
     riders.refresh();
     recomputeNextTarget();
     _recomputeRadiusGates(driverLocation.value);
+
+    // 📊 Log dropped
+    logManager.logRider(
+      action: 'RIDER_DROPPED',
+      bookingId: bookingId,
+      riderData: {
+        'name': riderName,
+        'remainingRiders': riders.where((r) => r.stage != SharedRiderStage.dropped).length,
+      },
+    );
   }
 
   void setActiveTarget(String bookingId, SharedRiderStage stage) {
@@ -355,6 +415,33 @@ class SharedRideController extends GetxController {
     activeTarget.value = any;
     _recomputeRadiusGates(driverLocation.value);
     return any;
+  }
+
+  /// Get all active riders (not just for one booking)
+  /// ✅ Use this for shared ride pools with multiple customers
+  List<SharedRiderItem> getAllActiveRiders() {
+    return riders
+        .where((r) => r.stage != SharedRiderStage.dropped)
+        .toList();
+  }
+
+  /// Get active riders for a specific booking (legacy - for single rides)
+  List<SharedRiderItem> getActiveRidersForBooking(String bookingId) {
+    return riders
+        .where((r) =>
+            r.bookingId == bookingId &&
+            r.stage != SharedRiderStage.dropped)
+        .toList();
+  }
+
+  /// Get riders by stage (waiting, onboard, etc)
+  List<SharedRiderItem> getRidersByStage(SharedRiderStage stage) {
+    return riders.where((r) => r.stage == stage).toList();
+  }
+
+  /// Get completed/dropped riders (for history)
+  List<SharedRiderItem> getDroppedRiders() {
+    return riders.where((r) => r.stage == SharedRiderStage.dropped).toList();
   }
 }
 
