@@ -1,0 +1,115 @@
+class AppImages {
+  static String roundCar = "assets/images/RoundCar.png";
+  static String apple = "assets/images/apple.png";
+  static String google = "assets/images/google.png";
+  static String mail = "assets/images/mail.png";
+  static String chat = "assets/images/chat.png";
+  static String backButton = "assets/images/backButton.png";
+  static String rightButton = "assets/images/rightButton.png";
+  static String terms = "assets/images/terms.png";
+  static String bike = "assets/images/bike.png";
+  static String star1 = "assets/images/star1.png";
+  static String car = "assets/images/car.png";
+  static String basicInfo = "assets/images/basicInfo.png";
+  static String payPall = "assets/images/payPall.png";
+  static String docUpload = "assets/images/docUpload.png";
+  static String history = "assets/images/history.png";
+  static String tick = "assets/images/tick.png";
+  static String close = "assets/images/close.png";
+  static String closeButton = "assets/images/closeButton.png";
+  static String clock = "assets/images/clock.png";
+  static String ninDoc = "assets/images/ninDoc.png";
+  static String applePay = "assets/images/applePay.png";
+  static String driverLicense = "assets/images/driverLicense.png";
+  static String boxLine = "assets/images/boxLine.png";
+  static String carOwnerDoc = "assets/images/carOwnerDoc.png";
+  static String carOwnerShip = "assets/images/carOwnerShip.png";
+  static String carDoc = "assets/images/carDoc.png";
+  static String stripe = "assets/images/stripe.png";
+  static String carInterior = "assets/images/carInterior.png";
+  static String consent = "assets/images/consent.png";
+  static String borderAdd = "assets/images/borderAdd.png";
+  static String exclamationCircle = "assets/images/exclamationCircle.png";
+  static String bikeOwner = "assets/images/bikeOwner.png";
+  static String bikeExterior = "assets/images/bikeExterior.png";
+  static String waitingReview = "assets/images/waitingReview.png";
+  static String dummyProfile = "assets/images/dummyProfile.png";
+  static String dropDown = "assets/images/dropDown.png";
+  static String splashScreen = "assets/images/Splash Screen.png";
+  static String redExclamation = "assets/images/redExclamation.png";
+  static String packageBike = "assets/images/packageBike.png";
+
+  static String animation = "assets/images/loading-light.gif";
+  static String carGif = "assets/images/carGif.gif";
+  static String loadingLightGif = "assets/images/loading-light.gif";
+  static String animation1 = "assets/images/animation.gif.gif";
+  static String loadingDarkGif = "assets/images/loading-dark.gif";
+
+  static String lock = "assets/images/lock.png";
+  static String parcelBike = "assets/images/parcelBike.png";
+  static String hopprPackage = "assets/images/hopprPackage.png";
+  static String search = "assets/images/search.png";
+  static String drawer = "assets/images/drawer.png";
+  static String offlineCar = "assets/images/offlineCar.png";
+  static String bCurrency = "assets/images/bCurrency.png";
+  static String filter = "assets/images/filter.png";
+  static String rightArrow = "assets/images/rightArrow.png";
+  static String notification = "assets/images/notification.png";
+  static String distance = "assets/images/distance.png";
+  static String time = "assets/images/time.png";
+  static String straight = "assets/images/straight.png";
+  static String call = "assets/images/call.png";
+  static String msg = "assets/images/msg.png";
+  static String dummyImg = "assets/images/dummyImg.png";
+  static String getHelp = "assets/images/getHelp.png";
+  static String share = "assets/images/share.png";
+  static String redArrow = "assets/images/redArrow.png";
+  static String movingCar = "assets/images/movingCar.png";
+  static String movingCar1 = "assets/images/movingCar1.png";
+  static String reLoaction = "assets/images/reLoaction.png";
+  static String driverCarMove = "assets/images/driverCarMove.png";
+  static String graph = "assets/images/graph.png";
+  static String no_internet = "assets/images/no_internet.png";
+  static String star = "assets/images/star.png";
+  static String starFill = "assets/images/starFill.png";
+  static String dummy = "assets/images/dummy.jpg";
+  static String dummy1 = "assets/images/dummy1.png";
+  static String camera = "assets/images/camera.png";
+  static String mic = "assets/images/mic.png";
+  static String sendButton = "assets/images/sendButton.png";
+  static String dart = "assets/images/dort.png";
+  static String box = "assets/images/box.png";
+  static String leftTurn = "assets/images/left-turn.png";
+  static String rightTurn = "assets/images/right-turn.png";
+
+  static String refund = "assets/images/refund.png";
+  static String wallet_top = "assets/images/wallet_top.png";
+  static String tripPayment = "assets/images/tripPayment.png";
+  static String packageDelivery = "assets/images/packageDelivery.png";
+  static String wallet = "assets/images/wallet.png";
+  static String bikeImage = "assets/images/tripPayment.png";
+  static String carImage = "assets/images/wallet_top.png";
+
+  static String currencyRound = "assets/images/currencyRound.png";
+  static String loc = "assets/images/loc.png";
+  static String help = "assets/images/help.png";
+  static String doc = "assets/images/doc.png";
+  static String sCar = "assets/images/sCar.png";
+
+  static String nCar = "assets/images/nCar.png";
+  static String twoPeople = "assets/images/twoPeople.png";
+  static String nPackage = "assets/images/nPackage.png";
+  static String nClose = "assets/images/nClose.png";
+
+  static String flutter_wave = "assets/images/flutter_wave.png";
+  static String payStack = "assets/images/payStack.png";
+
+  // Empty-state illustrations (image + text on empty / error screens).
+  static String emptyRides = "assets/images/empty_rides.png";
+  static String emptySupport = "assets/images/empty_support.png";
+  static String emptyWallet = "assets/images/empty_wallet.png";
+  static String emptyEarnings = "assets/images/empty_earnings.png";
+  static String emptyNotifications = "assets/images/empty_notifications.png";
+  static String emptyNoDrivers = "assets/images/empty_no_drivers.png";
+  static String errorServer = "assets/images/error_server.png";
+}

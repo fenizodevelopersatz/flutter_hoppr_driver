@@ -1,0 +1,4616 @@
+﻿import 'dart:async';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/cupertino.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:get/get.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:percent_indicator/percent_indicator.dart';
+import 'package:intl/intl.dart';
+import 'package:hopper/Core/Constants/Colors.dart';
+import 'package:hopper/Core/Constants/log.dart';
+import 'package:hopper/Core/Utility/app_loader.dart';
+import 'package:hopper/Core/Utility/Buttons.dart';
+import 'package:hopper/Core/Utility/images.dart';
+import 'package:hopper/utils/map/navigation_assist.dart';
+import 'package:hopper/api/repository/api_config_controller.dart';
+import 'package:hopper/utils/websocket/secondary_dispatch_socket.dart';
+import 'package:hopper/utils/ride_map/ride_map_view.dart';
+import '../../../utils/netWorkHandling/network_handling_screen.dart';
+import 'package:hopper/Presentation/Drawer/controller/ride_history_controller.dart';
+import 'package:hopper/Presentation/Drawer/screens/drawer_screens.dart';
+import 'package:hopper/Presentation/DriverScreen/controller/driver_status_controller.dart';
+import 'package:hopper/Presentation/DriverScreen/models/demand_opportunities_models.dart';
+import '../controller/driver_main_controller.dart';
+import 'SharedBooking/Controller/booking_request_controller.dart';
+import '../../Authentication/widgets/textFields.dart';
+import 'package:hopper/Presentation/OnBoarding/controller/chooseservice_controller.dart';
+import 'package:hopper/utils/widgets/hoppr_circular_loader.dart';
+
+class DriverMainScreen extends StatefulWidget {
+  const DriverMainScreen({super.key});
+
+  @override
+  State<DriverMainScreen> createState() => _DriverMainScreenState();
+}
+
+class _DriverMainScreenState extends State<DriverMainScreen>
+    with WidgetsBindingObserver {
+  late final DriverMainController c;
+  late final ChooseServiceController profileController;
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    // Ã¢Å“â€¦ create once (or reuse if already exists)
+    if (Get.isRegistered<DriverMainController>()) {
+      c = Get.find<DriverMainController>();
+      // DUAL-CONNECT: returning to home (e.g. after a ride completed and the cash
+      // screen did Get.offAll(DriverMainScreen)) reuses the permanent controller,
+      // so _prepare does NOT re-run. Reconcile the dual-connect state here:
+      // release any stale active-ride backend binding and restore the secondary
+      // single-ride dispatch socket if the driver is idle + shared-enabled.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        c.reconcileDualConnectAfterNavigation();
+      });
+    } else {
+      c = Get.put(DriverMainController(), permanent: true);
+    }
+
+    profileController =
+        Get.isRegistered<ChooseServiceController>()
+            ? Get.find<ChooseServiceController>()
+            : Get.put(ChooseServiceController(), permanent: true);
+
+    // Home owns profile refresh; drawer should only read cached data.
+    profileController.getUserDetails();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      c.onAppResumed(); // ensure BG service is stopped in foreground
+      c.checkAndResumeActiveBooking();
+      c.goToCurrentLocation();
+      c.refreshHomeStats(force: true);
+    });
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      c.onAppResumed();
+      c.checkAndResumeActiveBooking();
+      c.refreshHomeStats();
+      return;
+    }
+
+    // IMPORTANT: `inactive` can happen frequently (system dialogs, call UI,
+    // app-switcher gesture). Disconnecting socket here causes noisy
+    // `io client disconnect` logs and unnecessary reconnect churn.
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      c.onAppPaused();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // final c = Get.put(DriverMainController());
+
+    return NoInternetOverlay(
+      child: WillPopScope(
+        onWillPop: () async => true,
+        child: Scaffold(
+          body: SafeArea(
+            child: Obx(() {
+              // Always render the map immediately (even before location/serviceType),
+              // so the screen never looks blank. We only overlay a loader while
+              // data/location are warming up.
+              final showLoader =
+                  !c.ready.value || !c.statusController.hasServiceType;
+              if (showLoader) {
+                return Stack(
+                  children: [
+                    RideMapView(
+                      key: const ValueKey<String>('driver_map_bootstrap'),
+                      controller: c.rideMap,
+                      initialPosition:
+                          c.currentPosition.value ??
+                          const LatLng(9.914, 78.097),
+                      fitToBounds: false,
+                      mapStyle: c.mapStyle,
+                      myLocationEnabled: false,
+                      trafficEnabled: false,
+                      compassEnabled: false,
+                      onMapCreated: (gm) => c.mapController = gm,
+                      gestureRecognizers: {
+                        Factory<OneSequenceGestureRecognizer>(
+                          () => EagerGestureRecognizer(),
+                        ),
+                      },
+                    ),
+                    const Center(child: HopprCircularLoader(radius: 14)),
+                  ],
+                );
+              }
+
+              return Column(
+                children: [
+                  const SizedBox(height: 12),
+
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 14),
+                    child: _GlassHeader(
+                      onDrawer: () => Get.to(() => const DrawerScreen()),
+                      onToggle: c.toggleOnline,
+                      statusController: c.statusController,
+                    ),
+                  ),
+
+                  const SizedBox(height: 12),
+
+                  Expanded(
+                    child: Stack(
+                      children: [
+                        // Ã¢Å“â€¦ Map rebuilt only by GetBuilder(id: 'map')
+                        GetBuilder<DriverMainController>(
+                          id: 'map',
+                          builder: (_) {
+                            final markerSet = <Marker>{
+                              if (c.demandMarker != null) c.demandMarker!,
+                            };
+                            final circles = <Circle>{...c.demandCircles};
+
+                            return RepaintBoundary(
+                              child: RideMapView(
+                                key: ValueKey<String>(
+                                  'driver_map_${c.mapStyle ?? 'default'}',
+                                ),
+                                controller: c.rideMap,
+                                initialPosition:
+                                    c.currentPosition.value ??
+                                    const LatLng(9.914, 78.097),
+                                fitToBounds: false,
+                                mapStyle: c.mapStyle,
+                                myLocationEnabled: false,
+                                trafficEnabled: false,
+                                extraMarkers: markerSet,
+                                extraCircles: circles,
+                                onCameraMove: c.onMapCameraMove,
+                                onUserCameraMoveStarted: () {
+                                  c.followDriver.value = false;
+                                  c.rideMap.setAutoFollowEnabled(false);
+                                },
+                                onCameraIdle: () {
+                                  unawaited(c.updateDemandLabelOffset());
+                                },
+                                onMapCreated: (gm) async {
+                                  c.mapController = gm;
+                                  unawaited(c.updateDemandLabelOffset());
+                                },
+                                gestureRecognizers: {
+                                  Factory<OneSequenceGestureRecognizer>(
+                                    () => EagerGestureRecognizer(),
+                                  ),
+                                },
+                              ),
+                            );
+                          },
+                        ),
+
+                        // (Removed) map anchored label: user requested no label on map.
+
+                        // Active booking resume card (do NOT auto-navigate)
+                        Positioned(
+                          top: 14,
+                          left: 12,
+                          right: 12,
+                          child: Obx(() {
+                            final visible = c.showActiveBookingCard.value;
+                            final data = c.activeBookingData.value;
+                            if (!visible || data == null) {
+                              return const SizedBox.shrink();
+                            }
+
+                            bool asBool(dynamic v) {
+                              if (v == true) return true;
+                              final s = v?.toString().toLowerCase().trim();
+                              return s == 'true' || s == '1' || s == 'yes';
+                            }
+
+                            final bookingId =
+                                (data['bookingId'] ?? '').toString();
+                            final status = (data['status'] ?? '')
+                                .toString()
+                                .replaceAll('_', ' ');
+                            final pickup =
+                                (data['pickupAddress'] ?? '').toString();
+                            final drop = (data['dropAddress'] ?? '').toString();
+
+                            final live = data['driverLiveTracking'];
+                            final isShared =
+                                asBool(data['sharedBooking']) ||
+                                asBool(data['isShared']) ||
+                                asBool(data['shared']) ||
+                                (live is Map && asBool(live['sharedBooking']));
+
+                            final sharedBookingId =
+                                (data['sharedBookingId'] ?? '').toString();
+                            final displayBookingId =
+                                isShared && sharedBookingId.trim().isNotEmpty
+                                    ? sharedBookingId
+                                    : bookingId;
+
+                            final connectedCount =
+                                int.tryParse(
+                                  (data['connectedCustomersCount'] ?? '')
+                                      .toString(),
+                                ) ??
+                                (data['connectedCustomers'] is List
+                                    ? (data['connectedCustomers'] as List)
+                                        .length
+                                    : 0);
+
+                            return Material(
+                              color: Colors.transparent,
+                              child: Container(
+                                padding: const EdgeInsets.all(14),
+                                decoration: BoxDecoration(
+                                  color: Colors.white,
+                                  borderRadius: BorderRadius.circular(18),
+                                  border: Border.all(
+                                    color: Colors.black.withOpacity(0.08),
+                                  ),
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: Colors.black.withOpacity(0.10),
+                                      blurRadius: 18,
+                                      offset: const Offset(0, 10),
+                                    ),
+                                  ],
+                                ),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Row(
+                                      children: [
+                                        Expanded(
+                                          child: Text(
+                                            'Resume ride?',
+                                            style: const TextStyle(
+                                              fontWeight: FontWeight.w800,
+                                              fontSize: 15,
+                                            ),
+                                          ),
+                                        ),
+                                        Text(
+                                          displayBookingId.isEmpty
+                                              ? ''
+                                              : '#$displayBookingId',
+                                          style: TextStyle(
+                                            fontWeight: FontWeight.w700,
+                                            color: Colors.black.withOpacity(
+                                              0.55,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 6),
+                                    if (status.trim().isNotEmpty)
+                                      Text(
+                                        status,
+                                        style: TextStyle(
+                                          fontWeight: FontWeight.w700,
+                                          color: Colors.black.withOpacity(0.60),
+                                        ),
+                                      ),
+                                    if (isShared) ...[
+                                      const SizedBox(height: 10),
+                                      Row(
+                                        children: [
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 10,
+                                              vertical: 6,
+                                            ),
+                                            decoration: BoxDecoration(
+                                              color: AppColors.drkGreen
+                                                  .withOpacity(0.10),
+                                              borderRadius:
+                                                  BorderRadius.circular(999),
+                                              border: Border.all(
+                                                color: AppColors.drkGreen
+                                                    .withOpacity(0.25),
+                                              ),
+                                            ),
+                                            child: Text(
+                                              connectedCount > 0
+                                                  ? 'Shared ride - $connectedCount riders'
+                                                  : 'Shared ride',
+                                              style: TextStyle(
+                                                fontSize: 12,
+                                                fontWeight: FontWeight.w800,
+                                                color: AppColors.drkGreen,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
+                                    const SizedBox(height: 10),
+                                    if (pickup.trim().isNotEmpty)
+                                      Text(
+                                        'Pickup: $pickup',
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(fontSize: 12.5),
+                                      ),
+                                    if (drop.trim().isNotEmpty)
+                                      Padding(
+                                        padding: const EdgeInsets.only(top: 6),
+                                        child: Text(
+                                          'Drop: ${isShared && connectedCount > 1 ? 'Multiple destinations' : drop}',
+                                          maxLines: 2,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(
+                                            fontSize: 12.5,
+                                          ),
+                                        ),
+                                      ),
+                                    const SizedBox(height: 12),
+                                    Row(
+                                      children: [
+                                        Expanded(
+                                          child: ElevatedButton(
+                                            onPressed: c.resumeActiveBooking,
+                                            style: ElevatedButton.styleFrom(
+                                              backgroundColor:
+                                                  AppColors.commonBlack,
+                                              foregroundColor: Colors.white,
+                                              padding:
+                                                  const EdgeInsets.symmetric(
+                                                    vertical: 12,
+                                                  ),
+                                              shape: RoundedRectangleBorder(
+                                                borderRadius:
+                                                    BorderRadius.circular(12),
+                                              ),
+                                            ),
+                                            child: const Text(
+                                              'Resume',
+                                              style: TextStyle(
+                                                fontWeight: FontWeight.w800,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 10),
+                                        TextButton(
+                                          onPressed: c.dismissActiveBookingCard,
+                                          child: Text(
+                                            'Not now',
+                                            style: TextStyle(
+                                              fontWeight: FontWeight.w700,
+                                              color: Colors.black.withOpacity(
+                                                0.55,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          }),
+                        ),
+
+                        // Follow button
+                        Positioned(
+                          top: 190,
+                          right: 12,
+                          child: Obx(() {
+                            return FloatingActionButton(
+                              mini: true,
+                              backgroundColor: Colors.white,
+                              onPressed: () async {
+                                c.followDriver.value = true;
+                                await c.goToCurrentLocation();
+                              },
+                              child: Icon(
+                                c.followDriver.value
+                                    ? Icons.gps_fixed
+                                    : Icons.my_location,
+                                color: Colors.black,
+                              ),
+                            );
+                          }),
+                        ),
+
+                        // Bottom sheet only rebuilds on online/service changes
+                        Obx(() {
+                          final isOnline = c.statusController.isOnline.value;
+
+                          return IgnorePointer(
+                            ignoring: !isOnline,
+                            child: Opacity(
+                              opacity: isOnline ? 1.0 : 0.9,
+                              child: DriverBottomSheet(
+                                mainController: c,
+                                statusController: c.statusController,
+                                bookingController: c.bookingController,
+                                remainingSecondsRx: c.remainingSeconds,
+                                safeToDouble: c.safeToDouble,
+                                safeToInt: c.safeToInt,
+                                formatDuration: c.formatDuration,
+                                formatDistance: c.formatDistance,
+                              ),
+                            ),
+                          );
+                        }),
+                      ],
+                    ),
+                  ),
+                ],
+              );
+            }),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ==========================================================
+// Ã¢Å“â€¦ Glass Header widget (same UI)
+// ==========================================================
+class _GlassHeader extends StatelessWidget {
+  const _GlassHeader({
+    required this.onDrawer,
+    required this.onToggle,
+    required this.statusController,
+  });
+
+  final VoidCallback onDrawer;
+  final VoidCallback onToggle;
+  final DriverStatusController statusController;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.92),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.black.withOpacity(0.06)),
+        boxShadow: [
+          BoxShadow(
+            blurRadius: 20,
+            offset: const Offset(0, 8),
+            color: Colors.black.withOpacity(0.10),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          InkWell(
+            onTap: onDrawer,
+            child: Image.asset(AppImages.drawer, height: 26, width: 26),
+          ),
+          const Spacer(),
+          GestureDetector(
+            onTap: onToggle,
+            child: Obx(() {
+              final isOnline = statusController.isOnline.value;
+              // Show the spinner while the REST call runs OR while awaiting the
+              // server's authoritative confirmation (driver-online-status / ack).
+              final isLoading =
+                  statusController.isToggleLoading.value ||
+                  statusController.isTogglePending.value;
+              // IMPORTANT: read serviceType inside Obx so the icon updates immediately.
+              final serviceType = statusController.serviceType.value.trim();
+              final hasServiceType = serviceType.isNotEmpty;
+              final isCar = serviceType.toLowerCase() == 'car';
+              final vehicleAsset =
+                  isCar ? AppImages.offlineCar : AppImages.bike;
+
+              return AnimatedContainer(
+                duration: const Duration(milliseconds: 220),
+                curve: Curves.easeOut,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  color: isOnline ? AppColors.nBlue : Colors.black,
+                  borderRadius: BorderRadius.circular(30),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (isLoading) ...[
+                      const HopprCircularLoader(
+                        radius: 8,
+                        size: 16,
+                        color: Colors.white,
+                      ),
+                      const SizedBox(width: 10),
+                    ],
+                    if (isOnline) ...[
+                      const Text(
+                        "Online",
+                        style: TextStyle(color: Colors.white),
+                      ),
+                      const SizedBox(width: 10),
+                      Container(
+                        padding: const EdgeInsets.all(5),
+                        decoration: const BoxDecoration(
+                          color: Colors.white,
+                          shape: BoxShape.circle,
+                        ),
+                        child:
+                            hasServiceType
+                                ? Image.asset(
+                                  vehicleAsset,
+                                  width: 18,
+                                  height: 18,
+                                  color: AppColors.nBlue,
+                                )
+                                : HopprCircularLoader(
+                                  radius: 7,
+                                  size: 16,
+                                  color: AppColors.nBlue,
+                                ),
+                      ),
+                    ] else ...[
+                      Container(
+                        padding: const EdgeInsets.all(5),
+                        decoration: const BoxDecoration(
+                          color: Colors.white,
+                          shape: BoxShape.circle,
+                        ),
+                        child:
+                            hasServiceType
+                                ? Image.asset(
+                                  vehicleAsset,
+                                  width: 18,
+                                  height: 18,
+                                  color: Colors.black,
+                                )
+                                : HopprCircularLoader(
+                                  radius: 7,
+                                  size: 16,
+                                  color: Colors.black,
+                                ),
+                      ),
+                      const SizedBox(width: 10),
+                      const Text(
+                        "Offline",
+                        style: TextStyle(color: Colors.white),
+                      ),
+                    ],
+                  ],
+                ),
+              );
+            }),
+          ),
+          const Spacer(),
+          const SizedBox(width: 10),
+        ],
+      ),
+    );
+  }
+}
+
+class DriverBottomSheet extends StatefulWidget {
+  const DriverBottomSheet({
+    super.key,
+    required this.mainController,
+    required this.statusController,
+    required this.bookingController,
+    required this.remainingSecondsRx,
+    required this.safeToDouble,
+    required this.safeToInt,
+    required this.formatDuration,
+    required this.formatDistance,
+  });
+
+  final DriverMainController mainController;
+  final DriverStatusController statusController;
+  final BookingRequestController bookingController;
+
+  final RxInt remainingSecondsRx;
+
+  final double Function(dynamic) safeToDouble;
+  final int Function(dynamic) safeToInt;
+  final String Function(int) formatDuration;
+  final String Function(double) formatDistance;
+
+  @override
+  State<DriverBottomSheet> createState() => _DriverBottomSheetState();
+}
+
+class _DriverBottomSheetState extends State<DriverBottomSheet>
+    with SingleTickerProviderStateMixin {
+  final DraggableScrollableController _sheetCtrl =
+      DraggableScrollableController();
+
+  static const List<double> _snaps = [0.45, 0.65, 0.98];
+  double _currentSize = _snaps[1];
+  bool _isSnapping = false;
+  Timer? _snapDebounce;
+
+  String? _expandedDemandId;
+  bool _demandExpanded = false;
+
+  void _syncMapBottomPadding(double extent) {
+    // Ensure the driver marker/route never gets hidden behind this sheet.
+    // `RideMapView` reads `rideMap.bottomSheetHeight` and applies GoogleMap padding.
+    final mq = MediaQuery.of(context);
+    final availableH = mq.size.height - mq.padding.top - mq.padding.bottom;
+    final sheetH = (extent * availableH).clamp(0.0, availableH);
+    widget.mainController.rideMap.setBottomSheetHeight(sheetH);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _syncMapBottomPadding(_currentSize);
+    });
+  }
+
+  void _toggleDemandExpanded(DemandOpportunity opp) {
+    final id = opp.id.trim();
+    setState(() {
+      if (_expandedDemandId == id) {
+        _demandExpanded = !_demandExpanded;
+      } else {
+        _expandedDemandId = id;
+        _demandExpanded = true;
+      }
+    });
+    HapticFeedback.selectionClick();
+  }
+
+  bool _isDemandExpanded(DemandOpportunity opp) {
+    final id = opp.id.trim();
+    return _demandExpanded && _expandedDemandId == id;
+  }
+
+  double _nearestSnap(double size) {
+    double best = _snaps.first;
+    double bestDist = (size - best).abs();
+    for (final s in _snaps) {
+      final d = (size - s).abs();
+      if (d < bestDist) {
+        bestDist = d;
+        best = s;
+      }
+    }
+    return best;
+  }
+
+  void _scheduleSnap() {
+    _snapDebounce?.cancel();
+    _snapDebounce = Timer(const Duration(milliseconds: 120), () async {
+      if (!mounted) return;
+      if (_isSnapping) return;
+
+      final target = _nearestSnap(_currentSize);
+      if ((_currentSize - target).abs() < 0.03) return;
+
+      _isSnapping = true;
+      try {
+        await _sheetCtrl.animateTo(
+          target,
+          duration: const Duration(milliseconds: 260),
+          curve: Curves.easeOutCubic,
+        );
+      } catch (_) {
+        // ignore
+      } finally {
+        _isSnapping = false;
+      }
+    });
+  }
+
+  void _openDemandList(DriverMainController main) {
+    if (!main.showDemandCard) return;
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      elevation: 0,
+      builder: (_) {
+        final cs = Theme.of(context).colorScheme;
+
+        Color demandColor(String level) {
+          final l = level.trim().toLowerCase();
+          if (l.contains('high')) return const Color(0xFFEF4444);
+          if (l.contains('medium')) return const Color(0xFFF59E0B);
+          if (l.contains('low')) return const Color(0xFF10B981);
+          return cs.primary;
+        }
+
+        Widget metaChip({required IconData icon, required String label}) {
+          return Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: 0.04),
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(color: Colors.black.withValues(alpha: 0.06)),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  icon,
+                  size: 15,
+                  color: Colors.black.withValues(alpha: 0.60),
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.black.withValues(alpha: 0.72),
+                    letterSpacing: 0.1,
+                  ),
+                ),
+              ],
+            ),
+          );
+        }
+
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.only(top: 12),
+            child: Container(
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: const BorderRadius.vertical(
+                  top: Radius.circular(28),
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    blurRadius: 28,
+                    offset: const Offset(0, -12),
+                    color: Colors.black.withValues(alpha: 0.12),
+                  ),
+                ],
+              ),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 48,
+                        height: 5,
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(999),
+                          color: Colors.black.withValues(alpha: 0.10),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                    Row(
+                      children: [
+                        const Expanded(
+                          child: Text(
+                            'Demand Opportunities',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: 0.2,
+                            ),
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 7,
+                          ),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(999),
+                            color: cs.primary.withValues(alpha: 0.10),
+                            border: Border.all(
+                              color: cs.primary.withValues(alpha: 0.18),
+                            ),
+                          ),
+                          child: Text(
+                            '${main.demandOpportunities.length}',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w900,
+                              color: cs.primary,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Tap one to focus on the map.',
+                      style: TextStyle(
+                        color: Colors.black.withValues(alpha: 0.55),
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                    Flexible(
+                      child: ListView.separated(
+                        shrinkWrap: true,
+                        itemCount: main.demandOpportunities.length,
+                        separatorBuilder: (_, __) => const SizedBox(height: 12),
+                        itemBuilder: (ctx, i) {
+                          final opp = main.demandOpportunities[i];
+                          final km = opp.distanceKm;
+                          final distText =
+                              (km == null) ? '' : '${km.toStringAsFixed(1)} km';
+                          final cta = opp.cta.isNotEmpty ? opp.cta : 'View';
+                          final level = opp.demandLevel.trim();
+                          final levelColor =
+                              level.isEmpty ? cs.primary : demandColor(level);
+
+                          Future<void> focusAndClose() async {
+                            await main.focusDemandOpportunity(opp);
+                            if (!ctx.mounted) return;
+                            Navigator.of(ctx).pop();
+                          }
+
+                          return Obx(() {
+                            final selected =
+                                main.selectedDemandId.value?.trim() ?? '';
+                            final isSelected =
+                                selected.isNotEmpty &&
+                                selected == opp.id.trim();
+
+                            return AnimatedContainer(
+                              duration: const Duration(milliseconds: 220),
+                              curve: Curves.easeOutCubic,
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(16),
+                                color:
+                                    isSelected
+                                        ? cs.primary.withValues(alpha: 0.06)
+                                        : Colors.black.withValues(alpha: 0.02),
+                                border: Border.all(
+                                  color:
+                                      isSelected
+                                          ? cs.primary.withValues(alpha: 0.28)
+                                          : Colors.black.withValues(
+                                            alpha: 0.06,
+                                          ),
+                                ),
+                              ),
+                              child: Material(
+                                color: Colors.transparent,
+                                child: InkWell(
+                                  borderRadius: BorderRadius.circular(16),
+                                  onTap: focusAndClose,
+                                  child: Padding(
+                                    padding: const EdgeInsets.all(12),
+                                    child: Row(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Container(
+                                          width: 40,
+                                          height: 40,
+                                          decoration: BoxDecoration(
+                                            shape: BoxShape.circle,
+                                            color: levelColor.withValues(
+                                              alpha: 0.12,
+                                            ),
+                                            border: Border.all(
+                                              color: levelColor.withValues(
+                                                alpha: 0.22,
+                                              ),
+                                            ),
+                                          ),
+                                          child: Icon(
+                                            Icons.local_fire_department_rounded,
+                                            color: levelColor,
+                                            size: 20,
+                                          ),
+                                        ),
+                                        const SizedBox(width: 12),
+                                        Expanded(
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Text(
+                                                opp.title,
+                                                maxLines: 1,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: const TextStyle(
+                                                  fontWeight: FontWeight.w900,
+                                                  fontSize: 14,
+                                                  letterSpacing: 0.1,
+                                                ),
+                                              ),
+                                              const SizedBox(height: 4),
+                                              Text(
+                                                opp.message,
+                                                maxLines: 2,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: TextStyle(
+                                                  color: Colors.black
+                                                      .withValues(alpha: 0.60),
+                                                  fontWeight: FontWeight.w600,
+                                                ),
+                                              ),
+                                              const SizedBox(height: 8),
+                                              Wrap(
+                                                spacing: 8,
+                                                runSpacing: 8,
+                                                children: [
+                                                  if (level.isNotEmpty)
+                                                    Container(
+                                                      padding:
+                                                          const EdgeInsets.symmetric(
+                                                            horizontal: 10,
+                                                            vertical: 7,
+                                                          ),
+                                                      decoration: BoxDecoration(
+                                                        borderRadius:
+                                                            BorderRadius.circular(
+                                                              999,
+                                                            ),
+                                                        color: levelColor
+                                                            .withValues(
+                                                              alpha: 0.10,
+                                                            ),
+                                                        border: Border.all(
+                                                          color: levelColor
+                                                              .withValues(
+                                                                alpha: 0.18,
+                                                              ),
+                                                        ),
+                                                      ),
+                                                      child: Text(
+                                                        level.toUpperCase(),
+                                                        style: TextStyle(
+                                                          fontSize: 11,
+                                                          fontWeight:
+                                                              FontWeight.w900,
+                                                          color: levelColor,
+                                                          letterSpacing: 0.3,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  if (distText.isNotEmpty)
+                                                    metaChip(
+                                                      icon:
+                                                          Icons.near_me_rounded,
+                                                      label: distText,
+                                                    ),
+                                                ],
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                        const SizedBox(width: 12),
+                                        SizedBox(
+                                          height: 40,
+                                          child: FilledButton(
+                                            style: FilledButton.styleFrom(
+                                              backgroundColor:
+                                                  isSelected
+                                                      ? cs.primary
+                                                      : Colors.black.withValues(
+                                                        alpha: 0.88,
+                                                      ),
+                                              foregroundColor: Colors.white,
+                                              padding:
+                                                  const EdgeInsets.symmetric(
+                                                    horizontal: 12,
+                                                  ),
+                                              shape: RoundedRectangleBorder(
+                                                borderRadius:
+                                                    BorderRadius.circular(12),
+                                              ),
+                                            ),
+                                            onPressed: focusAndClose,
+                                            child: Text(
+                                              cta,
+                                              style: const TextStyle(
+                                                fontWeight: FontWeight.w900,
+                                                letterSpacing: 0.2,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            );
+                          });
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    _snapDebounce?.cancel();
+    super.dispose();
+  }
+
+  Color getTextColor({Color color = Colors.black}) =>
+      widget.statusController.isOnline.value ? color : Colors.black;
+
+  @override
+  Widget build(BuildContext context) {
+    return Obx(() {
+      // IMPORTANT: read serviceType inside Obx so the UI reacts to changes.
+      final serviceType = widget.statusController.serviceType.value;
+      final isCar = serviceType.trim().toLowerCase() == 'car';
+
+      return NotificationListener<DraggableScrollableNotification>(
+        onNotification: (n) {
+          _currentSize = n.extent;
+          _syncMapBottomPadding(n.extent);
+          if (n.extent <= _snaps.last && n.extent >= _snaps.first) {
+            _scheduleSnap();
+          }
+          return false;
+        },
+        child: DraggableScrollableSheet(
+          controller: _sheetCtrl,
+          initialChildSize: _snaps[1],
+          minChildSize: _snaps[0],
+          maxChildSize: _snaps[2],
+          snap: false,
+          builder: (context, scrollController) {
+            return Container(
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: const BorderRadius.vertical(
+                  top: Radius.circular(22),
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    blurRadius: 26,
+                    offset: const Offset(0, -10),
+                    color: Colors.black.withOpacity(0.10),
+                  ),
+                ],
+              ),
+              child: RefreshIndicator(
+                onRefresh: () async {
+                  await Get.find<ChooseServiceController>().getUserDetails();
+                  await widget.statusController.weeklyChallenges();
+                  await Get.find<RideHistoryController>().customerWalletHistory(
+                    isRefresh: true,
+                    showErrors: false,
+                  );
+                  final main = Get.find<DriverMainController>();
+                  main.requestDemandOpportunities(reason: 'pull_to_refresh');
+                  await main.fetchDemandOpportunities(silent: true);
+                  if (isCar) {
+                    await widget.statusController.todayActivity();
+                  } else {
+                    await widget.statusController.todayPackageActivity();
+                  }
+                },
+                child: ListView(
+                  controller: scrollController,
+                  physics: const AlwaysScrollableScrollPhysics(
+                    parent: BouncingScrollPhysics(),
+                  ),
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 44,
+                        height: 4,
+                        margin: const EdgeInsets.only(top: 10),
+                        decoration: BoxDecoration(
+                          color: Colors.grey[350],
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+
+                    // Demand opportunities card (hidden when empty/not eligible)
+                    Obx(() {
+                      final main = widget.mainController;
+                      if (!main.showDemandCard) return const SizedBox.shrink();
+
+                      final sel = main.selectedDemandId.value?.trim() ?? '';
+                      DemandOpportunity? rawOpp;
+                      if (sel.isNotEmpty) {
+                        for (final o in main.demandOpportunities) {
+                          if (o.id.trim() == sel) {
+                            rawOpp = o;
+                            break;
+                          }
+                        }
+                      }
+                      final DemandOpportunity opp =
+                          rawOpp ?? main.demandOpportunities.first;
+                      final km = opp.distanceKm;
+                      final distText =
+                          (km == null)
+                              ? null
+                              : '${km.toStringAsFixed(1)} km away';
+                      final badge =
+                          (main.demandData.value?.serviceType ??
+                                  opp.serviceType)
+                              .toString()
+                              .trim();
+                      final level =
+                          opp.demandLevel.isNotEmpty
+                              ? opp.demandLevel.toUpperCase()
+                              : '';
+                      final isSelected =
+                          sel.isNotEmpty && sel == (opp.id.trim());
+
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 6,
+                        ),
+                        child: Container(
+                          padding: const EdgeInsets.all(14),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(16),
+                            color:
+                                isSelected
+                                    ? Colors.black.withValues(alpha: 0.03)
+                                    : const Color(0xFFF7F8FA),
+                            border: Border.all(
+                              color:
+                                  isSelected
+                                      ? Theme.of(context).colorScheme.primary
+                                          .withValues(alpha: 0.22)
+                                      : Colors.black.withOpacity(0.06),
+                            ),
+                          ),
+                          child: Material(
+                            color: Colors.transparent,
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(16),
+                              onTap: () async {
+                                main.requestDemandOpportunities(
+                                  reason: 'card_tap',
+                                );
+                                await main.focusDemandOpportunity(opp);
+                              },
+                              child: Builder(
+                                builder: (context) {
+                                  final cs = Theme.of(context).colorScheme;
+                                  final levelText = level.trim();
+
+                                  Color levelColor() {
+                                    final l = levelText.toLowerCase();
+                                    if (l.contains('high'))
+                                      return const Color(0xFFEF4444);
+                                    if (l.contains('medium'))
+                                      return const Color(0xFFF59E0B);
+                                    if (l.contains('low'))
+                                      return const Color(0xFF10B981);
+                                    return cs.primary;
+                                  }
+
+                                  final lc = levelColor();
+                                  final expanded = _isDemandExpanded(opp);
+
+                                  Widget pill({
+                                    required Widget child,
+                                    Color? bg,
+                                    Color? border,
+                                  }) {
+                                    return Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 9,
+                                        vertical: 5,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        borderRadius: BorderRadius.circular(
+                                          999,
+                                        ),
+                                        color: bg ?? Colors.white,
+                                        border: Border.all(
+                                          color:
+                                              border ??
+                                              Colors.black.withValues(
+                                                alpha: 0.06,
+                                              ),
+                                        ),
+                                      ),
+                                      child: child,
+                                    );
+                                  }
+
+                                  return Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Row(
+                                        children: [
+                                          Expanded(
+                                            child: Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                Expanded(
+                                                  child: Row(
+                                                    children: [
+                                                      Icon(
+                                                        Icons
+                                                            .trending_up_rounded,
+                                                        size: 18,
+                                                        color: cs.primary,
+                                                      ),
+                                                      const SizedBox(width: 6),
+                                                      const Expanded(
+                                                        child: Text(
+                                                          'Demand Opportunity',
+                                                          maxLines: 1,
+                                                          overflow:
+                                                              TextOverflow
+                                                                  .ellipsis,
+                                                          style: TextStyle(
+                                                            fontSize: 15,
+                                                            fontWeight:
+                                                                FontWeight.w900,
+                                                            letterSpacing: 0.1,
+                                                          ),
+                                                        ),
+                                                      ),
+                                                    ],
+                                                  ),
+                                                ),
+                                                if (isSelected) ...[
+                                                  const SizedBox(width: 8),
+                                                  Container(
+                                                    padding:
+                                                        const EdgeInsets.symmetric(
+                                                          horizontal: 8,
+                                                          vertical: 4,
+                                                        ),
+                                                    decoration: BoxDecoration(
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                            999,
+                                                          ),
+                                                      color: cs.primary
+                                                          .withValues(
+                                                            alpha: 0.10,
+                                                          ),
+                                                      border: Border.all(
+                                                        color: cs.primary
+                                                            .withValues(
+                                                              alpha: 0.18,
+                                                            ),
+                                                      ),
+                                                    ),
+                                                    child: Text(
+                                                      'Selected',
+                                                      style: TextStyle(
+                                                        fontSize: 11,
+                                                        fontWeight:
+                                                            FontWeight.w900,
+                                                        color: cs.primary,
+                                                        letterSpacing: 0.2,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ],
+                                              ],
+                                            ),
+                                          ),
+                                          if (main.demandOpportunities.length >
+                                              1)
+                                            TextButton(
+                                              onPressed:
+                                                  () => _openDemandList(main),
+                                              style: TextButton.styleFrom(
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                      horizontal: 10,
+                                                      vertical: 8,
+                                                    ),
+                                                foregroundColor: cs.primary,
+                                              ),
+                                              child: const Text(
+                                                'See more',
+                                                style: TextStyle(
+                                                  fontWeight: FontWeight.w900,
+                                                  letterSpacing: 0.1,
+                                                ),
+                                              ),
+                                            ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 10),
+                                      Container(
+                                        decoration: BoxDecoration(
+                                          borderRadius: BorderRadius.circular(
+                                            18,
+                                          ),
+                                          gradient: LinearGradient(
+                                            begin: Alignment.topLeft,
+                                            end: Alignment.bottomRight,
+                                            colors: [
+                                              Colors.white,
+                                              const Color(0xFFF2F6FF),
+                                              const Color(0xFFF4F1FF),
+                                            ],
+                                          ),
+                                          border: Border.all(
+                                            color: Colors.black.withValues(
+                                              alpha: 0.06,
+                                            ),
+                                          ),
+                                          boxShadow: [
+                                            BoxShadow(
+                                              color: Colors.black.withValues(
+                                                alpha: 0.10,
+                                              ),
+                                              blurRadius: 16,
+                                              offset: const Offset(0, 10),
+                                            ),
+                                          ],
+                                        ),
+                                        child: IntrinsicHeight(
+                                          child: Row(
+                                            children: [
+                                              Container(
+                                                width: 5,
+                                                decoration: BoxDecoration(
+                                                  borderRadius:
+                                                      const BorderRadius.horizontal(
+                                                        left: Radius.circular(
+                                                          16,
+                                                        ),
+                                                      ),
+                                                  gradient: LinearGradient(
+                                                    begin: Alignment.topCenter,
+                                                    end: Alignment.bottomCenter,
+                                                    colors: [
+                                                      lc.withValues(
+                                                        alpha: 0.95,
+                                                      ),
+                                                      lc.withValues(
+                                                        alpha: 0.55,
+                                                      ),
+                                                    ],
+                                                  ),
+                                                ),
+                                              ),
+                                              const SizedBox(width: 12),
+                                              Expanded(
+                                                child: Padding(
+                                                  padding:
+                                                      const EdgeInsets.symmetric(
+                                                        vertical: 10,
+                                                      ),
+                                                  child: AnimatedSize(
+                                                    duration: const Duration(
+                                                      milliseconds: 260,
+                                                    ),
+                                                    curve: Curves.easeOutCubic,
+                                                    alignment:
+                                                        Alignment.topCenter,
+                                                    child: Column(
+                                                      crossAxisAlignment:
+                                                          CrossAxisAlignment
+                                                              .start,
+                                                      children: [
+                                                        Row(
+                                                          children: [
+                                                            Icon(
+                                                              Icons
+                                                                  .place_rounded,
+                                                              size: 16,
+                                                              color: lc,
+                                                            ),
+                                                            const SizedBox(
+                                                              width: 6,
+                                                            ),
+                                                            Expanded(
+                                                              child: Text(
+                                                                opp.title,
+                                                                maxLines:
+                                                                    expanded
+                                                                        ? 2
+                                                                        : 1,
+                                                                overflow:
+                                                                    TextOverflow
+                                                                        .ellipsis,
+                                                                style: const TextStyle(
+                                                                  fontSize: 14,
+                                                                  fontWeight:
+                                                                      FontWeight
+                                                                          .w900,
+                                                                  letterSpacing:
+                                                                      0.1,
+                                                                  color:
+                                                                      Colors
+                                                                          .black,
+                                                                ),
+                                                              ),
+                                                            ),
+                                                            const SizedBox(
+                                                              width: 6,
+                                                            ),
+                                                            Material(
+                                                              color:
+                                                                  Colors
+                                                                      .transparent,
+                                                              child: InkWell(
+                                                                borderRadius:
+                                                                    BorderRadius.circular(
+                                                                      999,
+                                                                    ),
+                                                                onTap:
+                                                                    () =>
+                                                                        _toggleDemandExpanded(
+                                                                          opp,
+                                                                        ),
+                                                                child: Ink(
+                                                                  padding:
+                                                                      const EdgeInsets.all(
+                                                                        6,
+                                                                      ),
+                                                                  decoration: BoxDecoration(
+                                                                    shape:
+                                                                        BoxShape
+                                                                            .circle,
+                                                                    color: cs
+                                                                        .primary
+                                                                        .withValues(
+                                                                          alpha:
+                                                                              0.08,
+                                                                        ),
+                                                                    border: Border.all(
+                                                                      color: cs
+                                                                          .primary
+                                                                          .withValues(
+                                                                            alpha:
+                                                                                0.14,
+                                                                          ),
+                                                                    ),
+                                                                  ),
+                                                                  child: AnimatedRotation(
+                                                                    turns:
+                                                                        expanded
+                                                                            ? 0.5
+                                                                            : 0.0,
+                                                                    duration: const Duration(
+                                                                      milliseconds:
+                                                                          220,
+                                                                    ),
+                                                                    curve:
+                                                                        Curves
+                                                                            .easeOutCubic,
+                                                                    child: Icon(
+                                                                      Icons
+                                                                          .expand_more_rounded,
+                                                                      size: 20,
+                                                                      color:
+                                                                          cs.primary,
+                                                                    ),
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                            ),
+                                                          ],
+                                                        ),
+                                                        if (opp
+                                                            .message
+                                                            .isNotEmpty) ...[
+                                                          const SizedBox(
+                                                            height: 6,
+                                                          ),
+                                                          Text(
+                                                            opp.message,
+                                                            maxLines:
+                                                                expanded
+                                                                    ? 6
+                                                                    : 1,
+                                                            overflow:
+                                                                TextOverflow
+                                                                    .ellipsis,
+                                                            style: TextStyle(
+                                                              color: Colors
+                                                                  .black
+                                                                  .withValues(
+                                                                    alpha: 0.66,
+                                                                  ),
+                                                              fontWeight:
+                                                                  FontWeight
+                                                                      .w700,
+                                                              height: 1.2,
+                                                            ),
+                                                          ),
+                                                        ],
+                                                        const SizedBox(
+                                                          height: 8,
+                                                        ),
+                                                        Wrap(
+                                                          spacing: 6,
+                                                          runSpacing: 6,
+                                                          children: [
+                                                            if (distText !=
+                                                                null)
+                                                              pill(
+                                                                child: Text(
+                                                                  distText
+                                                                      .replaceAll(
+                                                                        ' away',
+                                                                        '',
+                                                                      ),
+                                                                  style: TextStyle(
+                                                                    fontSize:
+                                                                        11,
+                                                                    fontWeight:
+                                                                        FontWeight
+                                                                            .w900,
+                                                                    color: Colors
+                                                                        .black
+                                                                        .withValues(
+                                                                          alpha:
+                                                                              0.70,
+                                                                        ),
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                            if (badge
+                                                                .isNotEmpty)
+                                                              pill(
+                                                                bg:
+                                                                    Colors
+                                                                        .black,
+                                                                border:
+                                                                    Colors
+                                                                        .black,
+                                                                child: Text(
+                                                                  badge,
+                                                                  style: const TextStyle(
+                                                                    fontSize:
+                                                                        11,
+                                                                    fontWeight:
+                                                                        FontWeight
+                                                                            .w900,
+                                                                    color:
+                                                                        Colors
+                                                                            .white,
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                            if (levelText
+                                                                .isNotEmpty)
+                                                              pill(
+                                                                bg: lc
+                                                                    .withValues(
+                                                                      alpha:
+                                                                          0.10,
+                                                                    ),
+                                                                border: lc
+                                                                    .withValues(
+                                                                      alpha:
+                                                                          0.18,
+                                                                    ),
+                                                                child: Text(
+                                                                  levelText
+                                                                      .toUpperCase(),
+                                                                  style: TextStyle(
+                                                                    fontSize:
+                                                                        11,
+                                                                    fontWeight:
+                                                                        FontWeight
+                                                                            .w900,
+                                                                    color: lc,
+                                                                    letterSpacing:
+                                                                        0.25,
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                          ],
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                              Padding(
+                                                padding: const EdgeInsets.only(
+                                                  right: 10,
+                                                  left: 10,
+                                                ),
+                                                child: SizedBox(
+                                                  width: 36,
+                                                  height: 36,
+                                                  child: DecoratedBox(
+                                                    decoration: BoxDecoration(
+                                                      shape: BoxShape.circle,
+                                                      color: cs.primary,
+                                                      boxShadow: [
+                                                        BoxShadow(
+                                                          color: cs.primary
+                                                              .withValues(
+                                                                alpha: 0.25,
+                                                              ),
+                                                          blurRadius: 16,
+                                                          offset: const Offset(
+                                                            0,
+                                                            10,
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ),
+                                                    child: Material(
+                                                      color: Colors.transparent,
+                                                      shape:
+                                                          const CircleBorder(),
+                                                      child: InkWell(
+                                                        customBorder:
+                                                            const CircleBorder(),
+                                                        onTap: () async {
+                                                          main.requestDemandOpportunities(
+                                                            reason: 'card_view',
+                                                          );
+                                                          await main
+                                                              .focusDemandOpportunity(
+                                                                opp,
+                                                              );
+                                                        },
+                                                        child: const Icon(
+                                                          Icons
+                                                              .arrow_forward_rounded,
+                                                          color: Colors.white,
+                                                          size: 18,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  );
+                                },
+                              ),
+                            ),
+                          ),
+                        ),
+                      );
+                    }),
+
+                    if (isCar) ...[
+                      Center(
+                        child: CustomTextfield.textWithStyles700(
+                          'Hoppr Car',
+                          color: AppColors.commonBlack.withOpacity(0.55),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Obx(() {
+                        final data =
+                            widget.bookingController.bookingRequestData.value;
+                        if (data == null) return const SizedBox.shrink();
+
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          child: Column(
+                            children: [
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 5,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: AppColors.red,
+                                      borderRadius: BorderRadius.circular(6),
+                                    ),
+                                    child: Obx(() {
+                                      return CustomTextfield.textWithStyles600(
+                                        color: AppColors.commonWhite,
+                                        '${widget.remainingSecondsRx.value}s',
+                                      );
+                                    }),
+                                  ),
+                                  const SizedBox(width: 14),
+                                  const Text(
+                                    "Respond within 25 seconds",
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 10),
+                              _CarBookingCardUI(
+                                data: data,
+                                statusController: widget.statusController,
+                                bookingController: widget.bookingController,
+                                safeToDouble: widget.safeToDouble,
+                                safeToInt: widget.safeToInt,
+                                formatDuration: widget.formatDuration,
+                                formatDistance: widget.formatDistance,
+                              ),
+                            ],
+                          ),
+                        );
+                      }),
+                    ] else ...[
+                      // Show service header only when there is no incoming request card.
+                      // (Prevents the "Hoppr Package" row looking duplicated.)
+                      Obx(() {
+                        final data =
+                            widget.bookingController.bookingRequestData.value;
+                        if (data != null) return const SizedBox.shrink();
+
+                        return Center(
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Opacity(
+                                opacity: 0.65,
+                                child: Image.asset(
+                                  AppImages.hopprPackage,
+                                  height: 26,
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      }),
+                      const SizedBox(height: 10),
+                      Obx(() {
+                        final data =
+                            widget.bookingController.bookingRequestData.value;
+                        if (data == null) return const SizedBox.shrink();
+
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          child: Column(
+                            children: [
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 5,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: AppColors.red,
+                                      borderRadius: BorderRadius.circular(6),
+                                    ),
+                                    child: Obx(() {
+                                      return CustomTextfield.textWithStyles600(
+                                        color: AppColors.commonWhite,
+                                        '${widget.remainingSecondsRx.value}s',
+                                      );
+                                    }),
+                                  ),
+                                  const SizedBox(width: 14),
+                                  const Text(
+                                    "Respond within 25 seconds",
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 10),
+                              _ParcelBookingCardUI(
+                                data: data,
+                                statusController: widget.statusController,
+                                bookingController: widget.bookingController,
+                                safeToDouble: widget.safeToDouble,
+                                safeToInt: widget.safeToInt,
+                                formatDuration: widget.formatDuration,
+                                formatDistance: widget.formatDistance,
+                              ),
+                            ],
+                          ),
+                        );
+                      }),
+                    ],
+
+                    Obx(() {
+                      if (widget.statusController.isOnline.value) {
+                        return const SizedBox(height: 6);
+                      }
+                      return Container(
+                        height: 54,
+                        color: AppColors.commonBlack,
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Image.asset(
+                              AppImages.graph,
+                              color: AppColors.commonWhite,
+                              height: 20,
+                            ),
+                            const SizedBox(width: 10),
+                            CustomTextfield.textWithStyles600(
+                              fontSize: 13,
+                              color: AppColors.commonWhite,
+                              'You are Offline - Go Online to get requests',
+                            ),
+                          ],
+                        ),
+                      );
+                    }),
+
+                    const SizedBox(height: 18),
+
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 17),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          CustomTextfield.textWithStyles700(
+                            'Weekly Challenges',
+                            fontSize: 16,
+                            color: getTextColor(),
+                          ),
+                          const SizedBox(height: 10),
+
+                          Container(
+                            decoration: const BoxDecoration(),
+                            child: Padding(
+                              padding: EdgeInsets.zero,
+                              child: Obx(() {
+                                if (!widget.statusController.hasServiceType) {
+                                  return const Center(
+                                    child: HopprCircularLoader(radius: 14),
+                                  );
+                                }
+                                final isCar = widget.statusController.isCar;
+                                final weeklyData =
+                                    widget
+                                        .statusController
+                                        .weeklyStatusData
+                                        .value;
+                                final parcelWeekly =
+                                    widget
+                                        .statusController
+                                        .parcelBookingData
+                                        .value
+                                        ?.weeklyProgress;
+
+                                final goal =
+                                    isCar
+                                        ? (weeklyData?.goal ?? 0)
+                                        : (parcelWeekly?.goal ?? 0);
+                                final totalTrips =
+                                    isCar
+                                        ? (weeklyData?.totalTrips ?? 0)
+                                        : (parcelWeekly?.totalTrips ?? 0);
+                                final progressPercent =
+                                    isCar
+                                        ? (weeklyData?.progressPercent ?? 0)
+                                        : (parcelWeekly?.progressPercent ??
+                                            0.0);
+
+                                DateTime? endsOn;
+                                if (!isCar) {
+                                  endsOn = parcelWeekly?.endsOn;
+                                  if (endsOn != null &&
+                                      endsOn.millisecondsSinceEpoch == 0) {
+                                    endsOn = null;
+                                  }
+                                }
+                                final endsLabel =
+                                    isCar
+                                        ? ((weeklyData?.endsOn ?? '').trim()
+                                                    .isNotEmpty
+                                                ? 'Ends on ${weeklyData!.endsOn}'
+                                                : 'Ends on -')
+                                        : (endsOn == null
+                                            ? 'Ends on -'
+                                            : 'Ends on ${DateFormat('EEEE').format(endsOn)}');
+
+                                final progress = (progressPercent / 100).clamp(
+                                  0.0,
+                                  1.0,
+                                );
+
+                                final challengeStatus =
+                                    (weeklyData?.challengeStatus ?? '')
+                                        .trim()
+                                        .toUpperCase();
+                                final rewardCredited =
+                                    isCar && (weeklyData?.rewardCredited ?? false);
+                                final showCreditedState =
+                                    rewardCredited || challengeStatus == 'PAID';
+                                final isAchievedState =
+                                    !showCreditedState &&
+                                    challengeStatus == 'ACHIEVED';
+                                final isInactiveState =
+                                    isCar && challengeStatus == 'INACTIVE';
+
+                                String formatAmount(double value) {
+                                  if (value == value.roundToDouble()) {
+                                    return value.toStringAsFixed(0);
+                                  }
+                                  return value.toStringAsFixed(2);
+                                }
+
+                                final rewardAmountLabel =
+                                    (weeklyData?.rewardDisplayAmount ?? '')
+                                            .trim()
+                                            .isNotEmpty
+                                        ? weeklyData!.rewardDisplayAmount
+                                        : formatAmount(
+                                          showCreditedState
+                                              ? (weeklyData?.rewardCreditedAmount ??
+                                                  0.0)
+                                              : (weeklyData?.reward ?? 0.0),
+                                        );
+                                final subtext =
+                                    isCar
+                                        ? ((weeklyData?.subtext ?? '').trim()
+                                                    .isNotEmpty
+                                                ? weeklyData!.subtext
+                                                : showCreditedState
+                                                ? '\u20A6$rewardAmountLabel has been added to your wallet.'
+                                                : isInactiveState
+                                                ? 'Your weekly challenge will appear here once it becomes active.'
+                                                : 'Keep going to unlock your weekly reward.')
+                                        : '$totalTrips trips done out of $goal';
+                                final badgeText =
+                                    isCar
+                                        ? ((weeklyData?.badgeText ?? '').trim()
+                                                    .isNotEmpty
+                                                ? weeklyData!.badgeText
+                                                : showCreditedState
+                                                ? 'Reward Added'
+                                                : isAchievedState
+                                                ? 'Challenge Achieved'
+                                                : isInactiveState
+                                                ? 'Inactive'
+                                                : 'In Progress')
+                                        : 'In Progress';
+                                final progressLine =
+                                    isCar
+                                        ? ((weeklyData?.progressText ?? '').trim()
+                                                    .isNotEmpty
+                                                ? weeklyData!.progressText
+                                                : '$totalTrips trips done out of $goal')
+                                        : '$totalTrips trips done out of $goal';
+
+                                final int remaining =
+                                    (goal - totalTrips) < 0
+                                        ? 0
+                                        : (goal - totalTrips);
+                                final bool done =
+                                    showCreditedState || isAchievedState;
+                                final List<int> milestones = [
+                                  (goal * 0.25).ceil(),
+                                  (goal * 0.5).ceil(),
+                                  (goal * 0.75).ceil(),
+                                  goal,
+                                ];
+                                final Color cAccent = isInactiveState
+                                    ? const Color(0xFF94A3B8)
+                                    : done
+                                        ? const Color(0xFF16A34A)
+                                        : const Color(0xFFE0561E);
+                                final Color cSoft = isInactiveState
+                                    ? const Color(0xFFEEF1F5)
+                                    : done
+                                        ? const Color(0xFFE7F6EC)
+                                        : const Color(0xFFFBEAE1);
+                                const Color cInk = Color(0xFF1A1A1A);
+                                const Color cMuted = Color(0xFF6B7280);
+
+                                Widget milestoneNode(int value, bool reached) {
+                                  return Container(
+                                    width: 30,
+                                    height: 30,
+                                    alignment: Alignment.center,
+                                    decoration: BoxDecoration(
+                                      color: reached ? cAccent : Colors.white,
+                                      shape: BoxShape.circle,
+                                      border: Border.all(
+                                        color: reached
+                                            ? cAccent
+                                            : cAccent.withOpacity(0.40),
+                                        width: 2,
+                                      ),
+                                    ),
+                                    child: Text(
+                                      '$value',
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w800,
+                                        color: reached ? Colors.white : cAccent,
+                                      ),
+                                    ),
+                                  );
+                                }
+
+                                return Container(
+                                  padding: const EdgeInsets.all(18),
+                                  decoration: BoxDecoration(
+                                    color: Colors.white,
+                                    borderRadius: BorderRadius.circular(22),
+                                    border: Border.all(
+                                      color: cAccent.withOpacity(0.35),
+                                      width: 1.3,
+                                    ),
+                                    boxShadow: [
+                                      BoxShadow(
+                                        color: Colors.black.withOpacity(0.05),
+                                        blurRadius: 18,
+                                        offset: const Offset(0, 8),
+                                      ),
+                                    ],
+                                  ),
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Row(
+                                        children: [
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 11,
+                                              vertical: 6,
+                                            ),
+                                            decoration: BoxDecoration(
+                                              color: cSoft,
+                                              borderRadius:
+                                                  BorderRadius.circular(999),
+                                            ),
+                                            child: Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                Container(
+                                                  width: 7,
+                                                  height: 7,
+                                                  decoration: BoxDecoration(
+                                                    color: cAccent,
+                                                    shape: BoxShape.circle,
+                                                  ),
+                                                ),
+                                                const SizedBox(width: 6),
+                                                Text(
+                                                  badgeText,
+                                                  style: TextStyle(
+                                                    color: cAccent,
+                                                    fontSize: 11.5,
+                                                    fontWeight: FontWeight.w700,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                          const Spacer(),
+                                          const Icon(
+                                            Icons.schedule_rounded,
+                                            size: 14,
+                                            color: cMuted,
+                                          ),
+                                          const SizedBox(width: 5),
+                                          Flexible(
+                                            child: Text(
+                                              endsLabel,
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: const TextStyle(
+                                                color: cMuted,
+                                                fontSize: 12,
+                                                fontWeight: FontWeight.w500,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 16),
+                                      Row(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.center,
+                                        children: [
+                                          Expanded(
+                                            child: Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                                Text(
+                                                  done
+                                                      ? 'Reward earned'
+                                                      : 'Weekly reward',
+                                                  style: const TextStyle(
+                                                    color: cMuted,
+                                                    fontSize: 13,
+                                                    fontWeight: FontWeight.w500,
+                                                  ),
+                                                ),
+                                                const SizedBox(height: 2),
+                                                Text(
+                                                  '\u20A6$rewardAmountLabel',
+                                                  style: const TextStyle(
+                                                    color: cInk,
+                                                    fontSize: 30,
+                                                    fontWeight: FontWeight.w800,
+                                                    height: 1.05,
+                                                  ),
+                                                ),
+                                                const SizedBox(height: 6),
+                                                Text(
+                                                  done
+                                                      ? subtext
+                                                      : 'Complete $goal trips to unlock',
+                                                  style: const TextStyle(
+                                                    color: cMuted,
+                                                    fontSize: 13,
+                                                    fontWeight: FontWeight.w500,
+                                                    height: 1.25,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                          const SizedBox(width: 14),
+                                          CircularPercentIndicator(
+                                            radius: 40.0,
+                                            lineWidth: 9.0,
+                                            animation: true,
+                                            percent: progress,
+                                            center: Text(
+                                              '${progressPercent.round()}%',
+                                              style: TextStyle(
+                                                fontWeight: FontWeight.w800,
+                                                fontSize: 15,
+                                                color: cAccent,
+                                              ),
+                                            ),
+                                            circularStrokeCap:
+                                                CircularStrokeCap.round,
+                                            backgroundColor: cSoft,
+                                            progressColor: cAccent,
+                                          ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 20),
+                                      if (goal >= 2)
+                                        LayoutBuilder(
+                                          builder: (ctx, cons) {
+                                            final w = cons.maxWidth;
+                                            const r = 15.0;
+                                            final span = w - 2 * r;
+                                            final cxs = List.generate(
+                                              4,
+                                              (i) => r + span * (i / 3),
+                                            );
+                                            return SizedBox(
+                                              height: 30,
+                                              child: Stack(
+                                                children: [
+                                                  Positioned(
+                                                    left: cxs.first,
+                                                    top: 13,
+                                                    child: Container(
+                                                      width: span,
+                                                      height: 4,
+                                                      decoration: BoxDecoration(
+                                                        color: cSoft,
+                                                        borderRadius:
+                                                            BorderRadius.circular(
+                                                              99,
+                                                            ),
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  Positioned(
+                                                    left: cxs.first,
+                                                    top: 13,
+                                                    child: Container(
+                                                      width:
+                                                          span *
+                                                          progress.clamp(
+                                                            0.0,
+                                                            1.0,
+                                                          ),
+                                                      height: 4,
+                                                      decoration: BoxDecoration(
+                                                        color: cAccent,
+                                                        borderRadius:
+                                                            BorderRadius.circular(
+                                                              99,
+                                                            ),
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  ...List.generate(4, (i) {
+                                                    return Positioned(
+                                                      left: cxs[i] - r,
+                                                      top: 0,
+                                                      child: milestoneNode(
+                                                        milestones[i],
+                                                        totalTrips >=
+                                                            milestones[i],
+                                                      ),
+                                                    );
+                                                  }),
+                                                ],
+                                              ),
+                                            );
+                                          },
+                                        ),
+                                      const SizedBox(height: 16),
+                                      Divider(
+                                        height: 1,
+                                        color: Colors.grey.shade200,
+                                      ),
+                                      const SizedBox(height: 12),
+                                      Row(
+                                        children: [
+                                          Icon(
+                                            done
+                                                ? Icons.emoji_events_rounded
+                                                : Icons.directions_car_rounded,
+                                            size: 16,
+                                            color: cAccent,
+                                          ),
+                                          const SizedBox(width: 8),
+                                          Expanded(
+                                            child: Text(
+                                              done || remaining <= 0
+                                                  ? progressLine
+                                                  : '$totalTrips / $goal trips done \u00B7 $remaining more to unlock',
+                                              style: const TextStyle(
+                                                color: cInk,
+                                                fontSize: 13,
+                                                fontWeight: FontWeight.w700,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              }),
+                            ),
+                          ),
+
+                          const SizedBox(height: 18),
+                          Obx(() {
+                            if (!widget.statusController.hasServiceType) {
+                              return const Padding(
+                                padding: EdgeInsets.symmetric(vertical: 18),
+                                child: Center(
+                                  child: HopprCircularLoader(radius: 14),
+                                ),
+                              );
+                            }
+
+                            final isCar = widget.statusController.isCar;
+                            return Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                CustomTextfield.textWithStyles700(
+                                  isCar
+                                      ? "Today's Activity"
+                                      : "Today's Package Activity",
+                                  fontSize: 16,
+                                ),
+                                const SizedBox(height: 10),
+                                if (isCar)
+                                  _TodayActivityCar(
+                                    statusController: widget.statusController,
+                                  )
+                                else
+                                  _TodayActivityParcel(
+                                    statusController: widget.statusController,
+                                  ),
+                              ],
+                            );
+                          }),
+
+                          const SizedBox(height: 18),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      );
+    });
+  }
+}
+
+/// ==========================================================
+/// Ã¢Å“â€¦ CAR Booking Card UI (kept, only safe null guards)
+/// ==========================================================
+class _CarBookingCardUI extends StatelessWidget {
+  const _CarBookingCardUI({
+    required this.data,
+    required this.statusController,
+    required this.bookingController,
+    required this.safeToDouble,
+    required this.safeToInt,
+    required this.formatDuration,
+    required this.formatDistance,
+  });
+
+  final Map<String, dynamic> data;
+  final DriverStatusController statusController;
+  final BookingRequestController bookingController;
+
+  final double Function(dynamic) safeToDouble;
+  final int Function(dynamic) safeToInt;
+  final String Function(int) formatDuration;
+  final String Function(double) formatDistance;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      elevation: 3,
+      child: Container(
+        decoration: BoxDecoration(
+          color: AppColors.commonWhite,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Column(
+          children: [
+            Container(
+              width: double.infinity,
+              height: 54,
+              decoration: BoxDecoration(
+                borderRadius: const BorderRadius.only(
+                  topLeft: Radius.circular(10),
+                  topRight: Radius.circular(10),
+                ),
+                color: AppColors.nBlue,
+              ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 15),
+                child: Row(
+                  children: [
+                    Image.asset(AppImages.notification, height: 25, width: 25),
+                    const SizedBox(width: 10),
+                    CustomTextfield.textWithStyles600(
+                      (data['rideType'] ?? '').toString().toLowerCase() ==
+                              'bike'
+                          ? 'New Package Request'
+                          : 'New Ride Request',
+                      color: AppColors.commonWhite,
+                    ),
+                    const Spacer(),
+                    CustomTextfield.textWithImage(
+                      imageColors: AppColors.commonWhite,
+                      text: '${data['estimatedPrice'] ?? ''}',
+                      imagePath: AppImages.bCurrency,
+                      colors: AppColors.commonWhite,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            Padding(
+              padding: const EdgeInsets.all(8.0),
+              child: Column(
+                children: [
+                  Row(
+                    children: [
+                      const Icon(Icons.circle, color: Colors.green, size: 12),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          (data['pickupAddress'] ?? '').toString(),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      const Icon(Icons.circle, color: Colors.red, size: 12),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          (data['dropAddress'] ?? '').toString(),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 15),
+              child: Divider(color: AppColors.commonBlack.withOpacity(0.1)),
+            ),
+
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 30),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                children: [
+                  Row(
+                    children: [
+                      Image.asset(AppImages.time, height: 20, width: 20),
+                      const SizedBox(width: 10),
+                      Text(
+                        formatDuration(safeToInt(data['estimateDuration'])),
+                        style: const TextStyle(fontWeight: FontWeight.w500),
+                      ),
+                    ],
+                  ),
+                  SizedBox(
+                    height: 40,
+                    child: VerticalDivider(
+                      color: AppColors.commonBlack.withOpacity(0.1),
+                    ),
+                  ),
+                  Row(
+                    children: [
+                      Image.asset(AppImages.distance, height: 20, width: 20),
+                      const SizedBox(width: 10),
+                      Text(
+                        formatDistance(safeToDouble(data['estimatedDistance'])),
+                        style: const TextStyle(fontWeight: FontWeight.w500),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 15),
+              child: Divider(color: AppColors.commonBlack.withOpacity(0.1)),
+            ),
+
+            Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: 8.0,
+                vertical: 10,
+              ),
+              child: Obx(() {
+                final isAcceptLoading =
+                    statusController.isBookingAcceptLoading.value;
+                final isRejectLoading =
+                    statusController.isBookingRejectLoading.value;
+                return Row(
+                  children: [
+                    Expanded(
+                      child: Buttons.button(
+                        borderRadius: 10,
+                        buttonColor: AppColors.red,
+                        onTap:
+                            isAcceptLoading || isRejectLoading
+                                ? null
+                                : () async {
+                                  HapticFeedback.selectionClick();
+                                  final id = data['bookingId']?.toString();
+                                  if (id == null || id.isEmpty) {
+                                    Get.find<DriverAnalyticsController>()
+                                        .trackDecline();
+                                    bookingController.clear();
+                                    return;
+                                  }
+                                  final result = await statusController
+                                      .bookingReject(bookingId: id);
+                                  if (result == 'success') {
+                                    Get.find<DriverAnalyticsController>()
+                                        .trackDecline(bookingId: id);
+                                    bookingController.markHandled(id);
+                                  }
+                                },
+                        text:
+                            isRejectLoading
+                                ? SizedBox(
+                                  height: 20,
+                                  width: 20,
+                                  child: AppLoader.circularLoader(),
+                                )
+                                : const Text('Decline'),
+                      ),
+                    ),
+                    const SizedBox(width: 20),
+
+                    Expanded(
+                      child: Buttons.button(
+                        borderRadius: 10,
+                        buttonColor: AppColors.drkGreen,
+                        onTap:
+                            isAcceptLoading || isRejectLoading
+                                ? null
+                                : () async {
+                                  HapticFeedback.mediumImpact();
+                                  try {
+                                    final bookingId = data['bookingId'];
+                                    final pickupAddress =
+                                        data['pickupAddress'] ?? '';
+                                    final isShared =
+                                        data['sharedBooking'] == true ||
+                                        (data['sharedBooking']
+                                                ?.toString()
+                                                .toLowerCase() ==
+                                            'true');
+                                    final dropAddress =
+                                        data['dropAddress'] ?? '';
+
+                                    final pickupLoc = data['pickupLocation'];
+                                    if (pickupLoc == null) return;
+
+                                    final pickup = LatLng(
+                                      (pickupLoc['latitude'] as num).toDouble(),
+                                      (pickupLoc['longitude'] as num)
+                                          .toDouble(),
+                                    );
+                                    // DUAL-CONNECT: bind this ride to the backend
+                                    // that owns it BEFORE the accept call so the
+                                    // API + primary socket target the right
+                                    // backend (bk for single, bck for shared).
+                                    // Single requests carry no `sharedBooking`,
+                                    // so isShared=false binds to single. Then drop
+                                    // the secondary dispatch socket for the ride.
+                                    try {
+                                      await Get.find<ApiConfigController>()
+                                          .bindActiveRideBackend(isShared);
+                                    } catch (_) {}
+                                    SecondaryDispatchSocket().stop();
+
+                                    if (isShared) {
+                                      CommonLogger.log.w(isShared);
+                                      await statusController
+                                          .bookingAcceptForSharedRide(
+                                            pickupLocationAddress:
+                                                pickupAddress,
+                                            dropLocationAddress: dropAddress,
+                                            context,
+                                            bookingId: bookingId,
+                                            status: 'ACCEPT',
+                                            pickupLocation: pickup,
+                                            driverLocation: pickup,
+                                          );
+                                    } else {
+                                      await statusController.bookingAccept(
+                                        pickupLocationAddress: pickupAddress,
+                                        dropLocationAddress: dropAddress,
+                                        context,
+                                        bookingId: bookingId,
+                                        status: 'ACCEPT',
+                                        pickupLocation: pickup,
+                                        driverLocation: pickup,
+                                      );
+                                    }
+
+                                    bookingController.markHandled(
+                                      bookingId.toString(),
+                                    );
+                                  } catch (e) {
+                                    bookingController.clear();
+                                    CommonLogger.log.e(
+                                      "Booking accept failed: $e",
+                                    );
+                                  }
+                                },
+                        text:
+                            isAcceptLoading
+                                ? SizedBox(
+                                  height: 20,
+                                  width: 20,
+                                  child: AppLoader.circularLoader(),
+                                )
+                                : const Text('Accept'),
+                      ),
+                    ),
+                  ],
+                );
+              }),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ParcelBookingCardUI extends StatelessWidget {
+  const _ParcelBookingCardUI({
+    required this.data,
+    required this.statusController,
+    required this.bookingController,
+    required this.safeToDouble,
+    required this.safeToInt,
+    required this.formatDuration,
+    required this.formatDistance,
+  });
+
+  final Map<String, dynamic> data;
+  final DriverStatusController statusController;
+  final BookingRequestController bookingController;
+
+  final double Function(dynamic) safeToDouble;
+  final int Function(dynamic) safeToInt;
+  final String Function(int) formatDuration;
+  final String Function(double) formatDistance;
+
+  @override
+  Widget build(BuildContext context) {
+    return _CarBookingCardUI(
+      data: data,
+      statusController: statusController,
+      bookingController: bookingController,
+      safeToDouble: safeToDouble,
+      safeToInt: safeToInt,
+      formatDuration: formatDuration,
+      formatDistance: formatDistance,
+    );
+  }
+}
+
+class _TodayActivityCar extends StatelessWidget {
+  const _TodayActivityCar({required this.statusController});
+  final DriverStatusController statusController;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppColors.commonBlack.withOpacity(0.1)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 25, vertical: 15),
+        child: Obx(() {
+          final data = statusController.todayStatusData.value;
+          return Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Column(
+                children: [
+                  CustomTextfield.textWithStyles600(
+                    'Earnings',
+                    color: AppColors.grey,
+                  ),
+                  CustomTextfield.textWithImage(
+                    text: data?.earnings.toString() ?? '0',
+                    colors: AppColors.commonBlack,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 16,
+                    imagePath: AppImages.bCurrency,
+                  ),
+                ],
+              ),
+              SizedBox(
+                height: 50,
+                child: VerticalDivider(
+                  color: AppColors.commonBlack.withOpacity(0.2),
+                ),
+              ),
+              Column(
+                children: [
+                  CustomTextfield.textWithStyles600(
+                    'Online',
+                    color: AppColors.grey,
+                  ),
+                  CustomTextfield.textWithImage(
+                    text: data?.online.toString() ?? '0',
+                    colors: AppColors.commonBlack,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 16,
+                  ),
+                ],
+              ),
+              SizedBox(
+                height: 50,
+                child: VerticalDivider(
+                  color: AppColors.commonBlack.withOpacity(0.2),
+                ),
+              ),
+              Column(
+                children: [
+                  CustomTextfield.textWithStyles600(
+                    'Rides',
+                    color: AppColors.grey,
+                  ),
+                  CustomTextfield.textWithImage(
+                    text: data?.rides.toString() ?? '0',
+                    colors: AppColors.commonBlack,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 16,
+                  ),
+                ],
+              ),
+            ],
+          );
+        }),
+      ),
+    );
+  }
+}
+
+class _TodayActivityParcel extends StatelessWidget {
+  const _TodayActivityParcel({required this.statusController});
+  final DriverStatusController statusController;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final w = constraints.maxWidth;
+        final horizontalPad =
+            w < 360
+                ? 14.0
+                : w < 420
+                ? 18.0
+                : 22.0;
+        final verticalPad = w < 360 ? 12.0 : 14.0;
+        final gap = w < 360 ? 10.0 : 16.0;
+        final iconPx = w < 360 ? 16.0 : 17.0;
+        final pillPad = w < 360 ? 9.0 : 10.0;
+
+        Widget metric({
+          required Color bg,
+          required Widget icon,
+          required Widget value,
+          required String label,
+        }) {
+          return Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: EdgeInsets.all(pillPad),
+                decoration: BoxDecoration(color: bg, shape: BoxShape.circle),
+                child: icon,
+              ),
+              const SizedBox(height: 6),
+              FittedBox(fit: BoxFit.scaleDown, child: value),
+              const SizedBox(height: 5),
+              FittedBox(
+                fit: BoxFit.scaleDown,
+                child: CustomTextfield.textWithStylesSmall(
+                  label,
+                  colors: AppColors.grey,
+                  maxLine: 1,
+                ),
+              ),
+            ],
+          );
+        }
+
+        return Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: AppColors.commonBlack.withOpacity(0.1)),
+          ),
+          child: Padding(
+            padding: EdgeInsets.symmetric(
+              horizontal: horizontalPad,
+              vertical: verticalPad,
+            ),
+            child: Obx(() {
+              final data = statusController.parcelBookingData.value;
+              return Row(
+                children: [
+                  Expanded(
+                    child: metric(
+                      bg: const Color(0xFFE2FBE9),
+                      icon: Image.asset(
+                        AppImages.bCurrency,
+                        height: iconPx,
+                        color: const Color(0xff009721),
+                      ),
+                      value: CustomTextfield.textWithImage(
+                        text: ((data?.earning ?? 0).toDouble()).toStringAsFixed(
+                          2,
+                        ),
+                        colors: AppColors.commonBlack,
+                        fontWeight: FontWeight.w700,
+                        fontSize: w < 360 ? 14 : 15,
+                        imagePath: AppImages.bCurrency,
+                      ),
+                      label: 'Earnings',
+                    ),
+                  ),
+                  SizedBox(width: gap),
+                  Expanded(
+                    child: metric(
+                      bg: const Color(0XFFDEEAFC),
+                      icon: Image.asset(AppImages.boxLine, height: iconPx),
+                      value: CustomTextfield.textWithImage(
+                        text: data?.completed.toString() ?? '0',
+                        colors: AppColors.commonBlack,
+                        fontWeight: FontWeight.w700,
+                        fontSize: w < 360 ? 15 : 16,
+                      ),
+                      label: 'Deliveries',
+                    ),
+                  ),
+                  SizedBox(width: gap),
+                  Expanded(
+                    child: metric(
+                      bg: AppColors.starColors,
+                      icon: Image.asset(
+                        AppImages.star,
+                        height: iconPx,
+                        color: const Color(0XFFC18C30),
+                      ),
+                      value: CustomTextfield.textWithImage(
+                        text: data?.rating.toString() ?? '0',
+                        colors: AppColors.commonBlack,
+                        fontWeight: FontWeight.w700,
+                        fontSize: w < 360 ? 15 : 16,
+                      ),
+                      label: 'Rating',
+                    ),
+                  ),
+                ],
+              );
+            }),
+          ),
+        );
+      },
+    );
+  }
+}
+
+// import 'dart:async';
+// import 'dart:math';
+// import 'package:flutter/foundation.dart';
+// import 'package:flutter/gestures.dart';
+// import 'package:flutter/material.dart';
+// import 'package:flutter/scheduler.dart';
+// import 'package:geocoding/geocoding.dart';
+// import 'package:geolocator/geolocator.dart';
+// import 'package:get/get.dart';
+// import 'package:google_maps_flutter/google_maps_flutter.dart';
+// import 'package:percent_indicator/percent_indicator.dart';
+//
+// import 'package:hopper/Core/Constants/Colors.dart';
+// import 'package:hopper/Core/Constants/log.dart';
+// import 'package:hopper/Core/Utility/app_loader.dart';
+// import 'package:hopper/Core/Utility/Buttons.dart';
+// import 'package:hopper/Core/Utility/images.dart';
+// import 'package:hopper/api/repository/api_constents.dart';
+// import 'package:hopper/utils/sharedprefsHelper/sharedprefs_handler.dart';
+// import 'package:hopper/utils/sharedprefsHelper/booking_local_data.dart';
+// import 'package:hopper/utils/websocket/socket_io_client.dart';
+// import '../../../api/repository/api_config_controller.dart';
+// import '../../../utils/netWorkHandling/network_handling_screen.dart';
+//
+// import 'package:hopper/Presentation/Drawer/screens/drawer_screens.dart';
+// import 'package:hopper/Presentation/DriverScreen/controller/driver_status_controller.dart';
+// import 'SharedBooking/Controller/booking_request_controller.dart';
+// import '../../Authentication/widgets/textFields.dart';
+//
+// class DriverMainScreen extends StatefulWidget {
+//   const DriverMainScreen({super.key});
+//
+//   @override
+//   State<DriverMainScreen> createState() => _DriverMainScreenState();
+// }
+//
+// class _DriverMainScreenState extends State<DriverMainScreen>
+//     with SingleTickerProviderStateMixin {
+//   // Controllers
+//   final bookingController = Get.find<BookingRequestController>();
+//   final DriverStatusController statusController = Get.put(
+//     DriverStatusController(),
+//   );
+//
+//   // Map
+//   GoogleMapController? _mapController;
+//   String? _mapStyle;
+//   LatLng? _currentPosition;
+//
+//   // Marker + animation
+//   BitmapDescriptor? _carIcon;
+//   Marker? _carMarker;
+//   LatLng? _lastPosition;
+//
+//   AnimationController? _animCtrl;
+//   Animation<double>? _anim;
+//   Tween<double>? _latTween;
+//   Tween<double>? _lngTween;
+//   Tween<double>? _rotTween;
+//
+//   // Socket + location
+//   late SocketService socketService;
+//   StreamSubscription<Position>? _locationSub;
+//   Timer? _emitTimer;
+//   Map<String, dynamic>? _latestLocationPayload;
+//
+//   String? driverId;
+//   String? _currentBookingId;
+//
+//   // Countdown for request
+//   Timer? _countdownTimer;
+//   int remainingSeconds = 15;
+//
+//   // Screen ready
+//   bool _ready = false;
+//
+//   // Uber-like follow mode
+//   final RxBool followDriver = true.obs;
+//   Timer? _cameraFollowTimer;
+//
+//   // ---------------- helpers ----------------
+//   double safeToDouble(dynamic value) {
+//     if (value is double) return value;
+//     if (value is int) return value.toDouble();
+//     return double.tryParse(value.toString()) ?? 0.0;
+//   }
+//
+//   int safeToInt(dynamic value) {
+//     if (value is int) return value;
+//     if (value is double) return value.round();
+//     return int.tryParse(value.toString()) ?? 0;
+//   }
+//
+//   String formatDistance(double meters) {
+//     final km = meters / 1000;
+//     return '${km.toStringAsFixed(1)} Km';
+//   }
+//
+//   String formatDuration(int minutes) {
+//     final hours = minutes ~/ 60;
+//     final rem = minutes % 60;
+//     return hours > 0 ? '$hours hr $rem min' : '$rem min';
+//   }
+//
+//   double _bearingBetween(LatLng start, LatLng end) {
+//     final lat1 = start.latitude * (pi / 180.0);
+//     final lon1 = start.longitude * (pi / 180.0);
+//     final lat2 = end.latitude * (pi / 180.0);
+//     final lon2 = end.longitude * (pi / 180.0);
+//
+//     final dLon = lon2 - lon1;
+//     final y = sin(dLon) * cos(lat2);
+//     final x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon);
+//
+//     final brng = atan2(y, x);
+//     return (brng * 180 / pi + 360) % 360;
+//   }
+//
+//   bool _movedEnough(LatLng a, LatLng b) {
+//     // ~2m threshold; prevents tiny jitter updates
+//     final dx = (a.latitude - b.latitude).abs();
+//     final dy = (a.longitude - b.longitude).abs();
+//     return (dx + dy) > 0.00002;
+//   }
+//
+//   // ---------------- permissions ----------------
+//   Future<bool> _ensureLocationPermission() async {
+//     final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+//     if (!serviceEnabled) {
+//       Get.snackbar(
+//         "Location Disabled",
+//         "Please enable location services to use the app.",
+//       );
+//       return false;
+//     }
+//
+//     var permission = await Geolocator.checkPermission();
+//     if (permission == LocationPermission.denied) {
+//       permission = await Geolocator.requestPermission();
+//     }
+//
+//     if (permission == LocationPermission.denied) return false;
+//     if (permission == LocationPermission.deniedForever) {
+//       await Geolocator.openAppSettings();
+//       return false;
+//     }
+//
+//     return true;
+//   }
+//
+//   Future<Position?> _getCurrentPos() async {
+//     final ok = await _ensureLocationPermission();
+//     if (!ok) return null;
+//     return Geolocator.getCurrentPosition(
+//       desiredAccuracy: LocationAccuracy.high,
+//     );
+//   }
+//
+//   // ---------------- map style ----------------
+//   Future<void> _loadMapStyle() async {
+//     try {
+//       final style = await DefaultAssetBundle.of(
+//         context,
+//       ).loadString('assets/map_style/map_style.json');
+//       _mapStyle = style;
+//       if (_mapController != null) {
+//         await _mapController!.setMapStyle(style);
+//       }
+//     } catch (e) {
+//       if (kDebugMode) {
+//         CommonLogger.log.w("Map style load failed: $e");
+//       }
+//     }
+//   }
+//
+//   // ---------------- icon ----------------
+//   Future<void> _loadCustomCarIcon() async {
+//     if (statusController.serviceType.value == "Car") {
+//       _carIcon = await BitmapDescriptor.asset(
+//         const ImageConfiguration(size: Size(57, 57)),
+//         AppImages.movingCar,
+//       );
+//     } else {
+//       _carIcon = await BitmapDescriptor.asset(
+//         const ImageConfiguration(size: Size(57, 57)),
+//         AppImages.parcelBike,
+//       );
+//     }
+//   }
+//
+//   // ---------------- marker update ----------------
+//   void _updateCarMarker(LatLng newPos) {
+//     if (!mounted) return;
+//     if (_carIcon == null) return;
+//     if (_animCtrl == null || _anim == null) return;
+//
+//     if (_lastPosition == null) {
+//       _carMarker = Marker(
+//         markerId: const MarkerId('car'),
+//         position: newPos,
+//         icon: _carIcon!,
+//         rotation: 0,
+//         anchor: const Offset(0.5, 0.5),
+//         flat: true,
+//       );
+//       _lastPosition = newPos;
+//       setState(() {});
+//       return;
+//     }
+//
+//     if (!_movedEnough(_lastPosition!, newPos)) return;
+//
+//     final bearing = _bearingBetween(_lastPosition!, newPos);
+//
+//     _latTween = Tween(begin: _lastPosition!.latitude, end: newPos.latitude);
+//     _lngTween = Tween(begin: _lastPosition!.longitude, end: newPos.longitude);
+//     _rotTween = Tween(begin: _carMarker?.rotation ?? 0, end: bearing);
+//
+//     _animCtrl!
+//       ..stop()
+//       ..reset()
+//       ..forward();
+//
+//     _lastPosition = newPos;
+//   }
+//
+//   // ---------------- init location ----------------
+//   Future<void> _initLocation() async {
+//     final pos = await _getCurrentPos();
+//     if (pos == null) return;
+//
+//     final latLng = LatLng(pos.latitude, pos.longitude);
+//
+//     if (!mounted) return;
+//     setState(() => _currentPosition = latLng);
+//
+//     _updateCarMarker(latLng);
+//
+//     await _mapController?.animateCamera(
+//       CameraUpdate.newCameraPosition(
+//         CameraPosition(target: latLng, zoom: 16.6, tilt: 35),
+//       ),
+//     );
+//   }
+//
+//   Future<void> _goToCurrentLocation() async {
+//     final pos = await _getCurrentPos();
+//     if (pos == null) return;
+//
+//     final latLng = LatLng(pos.latitude, pos.longitude);
+//     await _mapController?.animateCamera(
+//       CameraUpdate.newCameraPosition(
+//         CameraPosition(target: latLng, zoom: 16.8, tilt: 35),
+//       ),
+//     );
+//     _updateCarMarker(latLng);
+//   }
+//
+//   // ---------------- reverse geo ----------------
+//   Future<String> getAddressFromLatLng(double lat, double lng) async {
+//     try {
+//       final placemarks = await placemarkFromCoordinates(lat, lng);
+//       if (placemarks.isEmpty) return "Location not available";
+//       final place = placemarks.first;
+//       return "${place.name}, ${place.locality}, ${place.administrativeArea}";
+//     } catch (_) {
+//       return "Location not available";
+//     }
+//   }
+//
+//   // ---------------- countdown ----------------
+//   void _startCountdown() {
+//     _countdownTimer?.cancel();
+//     remainingSeconds = 15;
+//
+//     _countdownTimer = Timer.periodic(const Duration(seconds: 1), (t) {
+//       if (!mounted) return;
+//
+//       if (remainingSeconds > 0) {
+//         setState(() => remainingSeconds--);
+//       } else {
+//         t.cancel();
+//         bookingController.clear();
+//       }
+//     });
+//   }
+//
+//   // ---------------- camera follow (Uber feel) ----------------
+//   void _startCameraFollow() {
+//     _cameraFollowTimer?.cancel();
+//
+//     _cameraFollowTimer = Timer.periodic(const Duration(milliseconds: 900), (
+//       _,
+//     ) async {
+//       if (!followDriver.value) return;
+//       if (_lastPosition == null) return;
+//       if (_mapController == null) return;
+//
+//       final bearing = _carMarker?.rotation ?? 0;
+//
+//       await _mapController!.animateCamera(
+//         CameraUpdate.newCameraPosition(
+//           CameraPosition(
+//             target: _lastPosition!,
+//             zoom: 16.8,
+//             tilt: 40,
+//             bearing: bearing,
+//           ),
+//         ),
+//       );
+//     });
+//   }
+//
+//   // ---------------- socket + location stream ----------------
+//   Future<void> _startEmitLoop() async {
+//     await _locationSub?.cancel();
+//     _emitTimer?.cancel();
+//
+//     _locationSub = Geolocator.getPositionStream(
+//       locationSettings: const LocationSettings(
+//         accuracy: LocationAccuracy.high,
+//         distanceFilter: 8, // Ã¢Å“â€¦ smoother & less spam than 0/5
+//       ),
+//     ).listen((pos) {
+//       _latestLocationPayload = {
+//         'userId': driverId,
+//         'latitude': pos.latitude,
+//         'longitude': pos.longitude,
+//         if (_currentBookingId != null) 'bookingId': _currentBookingId,
+//       };
+//
+//       // marker update locally for smooth UI
+//       _updateCarMarker(LatLng(pos.latitude, pos.longitude));
+//     });
+//
+//     _emitTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+//       if (!statusController.isOnline.value) return;
+//       if (_latestLocationPayload == null) return;
+//
+//       socketService.emit('updateLocation', _latestLocationPayload!);
+//     });
+//   }
+//
+//   Future<void> _initSocketAndLocation() async {
+//     driverId = await SharedPrefHelper.getDriverId();
+//     if (driverId == null) return;
+//     final cfg = Get.find<ApiConfigController>();
+//     socketService = SocketService();
+//     socketService.initSocket(cfg.socketUrl);
+//
+//     socketService.on('connect', (_) {
+//       socketService.registerDriver(
+//         driverId ?? '',
+//         bookingId: _currentBookingId,
+//         ack: (resp) {
+//           if (kDebugMode) CommonLogger.log.i("register ack: $resp");
+//         },
+//       );
+//     });
+//
+//     socketService.on('registered', (_) async {
+//       await _startEmitLoop();
+//     });
+//
+//     socketService.on('booking-request', (data) async {
+//       if (data == null) return;
+//       BookingDataService().setBookingData(data);
+//
+//       if (data['type'] == 'active-bookings') {
+//         final List active = data['activeBookings'] ?? [];
+//         if (active.isEmpty) return;
+//
+//         final booking = active.first;
+//         _currentBookingId = booking['bookingId']?.toString();
+//
+//         final fromLat = (booking['fromLatitude'] as num?)?.toDouble();
+//         final fromLng = (booking['fromLongitude'] as num?)?.toDouble();
+//         final toLat = (booking['toLatitude'] as num?)?.toDouble();
+//         final toLng = (booking['toLongitude'] as num?)?.toDouble();
+//         if (fromLat == null ||
+//             fromLng == null ||
+//             toLat == null ||
+//             toLng == null)
+//           return;
+//
+//         final pickupAddr = await getAddressFromLatLng(fromLat, fromLng);
+//         final dropAddr = await getAddressFromLatLng(toLat, toLng);
+//
+//         bookingController.showRequest(
+//           rawData: booking,
+//           pickupAddress: pickupAddr,
+//           dropAddress: dropAddr,
+//         );
+//         _startCountdown();
+//         return;
+//       }
+//
+//       _currentBookingId = data['bookingId']?.toString();
+//       final pickup = data['pickupLocation'];
+//       final drop = data['dropLocation'];
+//       if (pickup == null || drop == null) return;
+//
+//       final pickupLat = (pickup['latitude'] as num?)?.toDouble();
+//       final pickupLng = (pickup['longitude'] as num?)?.toDouble();
+//       final dropLat = (drop['latitude'] as num?)?.toDouble();
+//       final dropLng = (drop['longitude'] as num?)?.toDouble();
+//       if (pickupLat == null ||
+//           pickupLng == null ||
+//           dropLat == null ||
+//           dropLng == null)
+//         return;
+//
+//       final pickupAddr = await getAddressFromLatLng(pickupLat, pickupLng);
+//       final dropAddr = await getAddressFromLatLng(dropLat, dropLng);
+//
+//       bookingController.showRequest(
+//         rawData: data,
+//         pickupAddress: pickupAddr,
+//         dropAddress: dropAddr,
+//       );
+//       _startCountdown();
+//     });
+//
+//     await _initLocation();
+//     _startCameraFollow();
+//   }
+//
+//   // ---------------- toggle online ----------------
+//   Future<void> _toggleOnline() async {
+//     if (statusController.isLoading.value) return;
+//     statusController.isLoading.value = true;
+//
+//     try {
+//       statusController.toggleStatus();
+//       final isOnline = statusController.isOnline.value;
+//
+//       double lat = 0, lng = 0;
+//       if (isOnline) {
+//         final pos = await _getCurrentPos();
+//         if (pos == null) {
+//           statusController.toggleStatus();
+//           return;
+//         }
+//         lat = pos.latitude;
+//         lng = pos.longitude;
+//       }
+//
+//       await statusController.onlineAcceptStatus(
+//         context,
+//         status: isOnline,
+//         latitude: lat,
+//         longitude: lng,
+//       );
+//
+//       if (isOnline) {
+//         followDriver.value = true;
+//         await _goToCurrentLocation();
+//       }
+//     } catch (e) {
+//       statusController.toggleStatus();
+//       CommonLogger.log.e("toggle online error: $e");
+//     } finally {
+//       statusController.isLoading.value = false;
+//     }
+//   }
+//
+//   // ---------------- init / dispose ----------------
+//   @override
+//   void initState() {
+//     super.initState();
+//
+//     _animCtrl = AnimationController(
+//       vsync: this,
+//       duration: const Duration(milliseconds: 650), // Ã¢Å“â€¦ smoother
+//     );
+//
+//     _anim = CurvedAnimation(parent: _animCtrl!, curve: Curves.easeOutCubic)
+//       ..addListener(() {
+//         if (!mounted) return;
+//         if (_latTween == null || _lngTween == null || _rotTween == null) return;
+//
+//         final lat = _latTween!.evaluate(_anim!);
+//         final lng = _lngTween!.evaluate(_anim!);
+//         final rot = _rotTween!.evaluate(_anim!);
+//
+//         setState(() {
+//           _carMarker = Marker(
+//             markerId: const MarkerId('car'),
+//             position: LatLng(lat, lng),
+//             icon: _carIcon ?? BitmapDescriptor.defaultMarker,
+//             rotation: rot,
+//             anchor: const Offset(0.5, 0.5),
+//             flat: true,
+//           );
+//         });
+//       });
+//
+//     _prepare();
+//   }
+//
+//   Future<void> _prepare() async {
+//     try {
+//       await statusController.getDriverStatus();
+//       await _loadCustomCarIcon();
+//
+//       if (mounted) setState(() => _ready = true);
+//
+//       SchedulerBinding.instance.addPostFrameCallback((_) async {
+//         await _loadMapStyle();
+//
+//         statusController.weeklyChallenges();
+//         statusController.todayActivity();
+//         statusController.todayPackageActivity();
+//       });
+//
+//       await _initSocketAndLocation();
+//     } catch (e) {
+//       CommonLogger.log.e("prepare error: $e");
+//       if (mounted) setState(() => _ready = true);
+//     }
+//   }
+//
+//   @override
+//   void dispose() {
+//     _countdownTimer?.cancel();
+//     _emitTimer?.cancel();
+//     _cameraFollowTimer?.cancel();
+//     _locationSub?.cancel();
+//     _animCtrl?.dispose();
+//
+//     try {
+//       socketService.dispose();
+//     } catch (_) {}
+//
+//     super.dispose();
+//   }
+//
+//   // ---------------- UI ----------------
+//   @override
+//   Widget build(BuildContext context) {
+//     return NoInternetOverlay(
+//       child: WillPopScope(
+//         onWillPop: () async {
+//           return await true;
+//         },
+//         child: Scaffold(
+//           body: SafeArea(
+//             child:
+//                 !_ready
+//                     ? Center(child: AppLoader.circularLoader())
+//                     : Column(
+//                       children: [
+//                         const SizedBox(height: 12),
+//
+//                         Padding(
+//                           padding: const EdgeInsets.symmetric(horizontal: 14),
+//                           child: _GlassHeader(
+//                             onDrawer: () => Get.to(() => const DrawerScreen()),
+//                             onToggle: _toggleOnline,
+//                             statusController: statusController,
+//                           ),
+//                         ),
+//
+//                         const SizedBox(height: 12),
+//
+//                         Expanded(
+//                           child: Stack(
+//                             children: [
+//                               // Ã¢Å“â€¦ Map NEVER depends on Obx => no rebuild => smooth
+//                               RepaintBoundary(
+//                                 child: GoogleMap(
+//                                   mapType: MapType.normal,
+//                                   compassEnabled: false,
+//                                   myLocationEnabled: false,
+//                                   myLocationButtonEnabled: false,
+//                                   zoomControlsEnabled: false,
+//                                   buildingsEnabled: true,
+//                                   trafficEnabled: false,
+//                                   tiltGesturesEnabled: true,
+//                                   rotateGesturesEnabled: true,
+//                                   scrollGesturesEnabled: true,
+//                                   zoomGesturesEnabled: true,
+//                                   liteModeEnabled: false,
+//
+//                                   padding: const EdgeInsets.only(bottom: 260),
+//
+//                                   initialCameraPosition: CameraPosition(
+//                                     target:
+//                                         _currentPosition ??
+//                                         const LatLng(9.914, 78.097),
+//                                     zoom: 16,
+//                                   ),
+//
+//                                   markers:
+//                                       _carMarker != null ? {_carMarker!} : {},
+//
+//                                   onCameraMoveStarted: () {
+//                                     // Ã¢Å“â€¦ stop follow when user touches map
+//                                     followDriver.value = false;
+//                                   },
+//
+//                                   onMapCreated: (c) async {
+//                                     _mapController = c;
+//                                     if (_mapStyle != null) {
+//                                       await _mapController!.setMapStyle(
+//                                         _mapStyle,
+//                                       );
+//                                     }
+//                                   },
+//
+//                                   gestureRecognizers: {
+//                                     Factory<OneSequenceGestureRecognizer>(
+//                                       () => EagerGestureRecognizer(),
+//                                     ),
+//                                   },
+//                                 ),
+//                               ),
+//
+//                               // Ã¢Å“â€¦ Follow button (Uber)
+//                               Positioned(
+//                                 top: 190,
+//                                 right: 12,
+//                                 child: Obx(() {
+//                                   return FloatingActionButton(
+//                                     mini: true,
+//                                     backgroundColor: Colors.white,
+//                                     onPressed: () async {
+//                                       followDriver.value = true;
+//                                       await _goToCurrentLocation();
+//                                     },
+//                                     child: Icon(
+//                                       followDriver.value
+//                                           ? Icons.gps_fixed
+//                                           : Icons.my_location,
+//                                       color: Colors.black,
+//                                     ),
+//                                   );
+//                                 }),
+//                               ),
+//
+//                               // Ã¢Å“â€¦ Bottom sheet only rebuilds on online / service type etc
+//                               Obx(() {
+//                                 final isOnline =
+//                                     statusController.isOnline.value;
+//
+//                                 return IgnorePointer(
+//                                   ignoring: !isOnline,
+//                                   child: Opacity(
+//                                     opacity: isOnline ? 1.0 : 0.9,
+//                                     child: DriverBottomSheet(
+//                                       statusController: statusController,
+//                                       bookingController: bookingController,
+//                                       remainingSeconds: remainingSeconds,
+//                                       safeToDouble: safeToDouble,
+//                                       safeToInt: safeToInt,
+//                                       formatDuration: formatDuration,
+//                                       formatDistance: formatDistance,
+//                                     ),
+//                                   ),
+//                                 );
+//                               }),
+//                             ],
+//                           ),
+//                         ),
+//                       ],
+//                     ),
+//           ),
+//         ),
+//       ),
+//     );
+//   }
+// }
+//
+// // ==========================================================
+// // Ã¢Å“â€¦ Glass Header widget (UI polish)
+// // ==========================================================
+// class _GlassHeader extends StatelessWidget {
+//   const _GlassHeader({
+//     required this.onDrawer,
+//     required this.onToggle,
+//     required this.statusController,
+//   });
+//
+//   final VoidCallback onDrawer;
+//   final VoidCallback onToggle;
+//   final DriverStatusController statusController;
+//
+//   @override
+//   Widget build(BuildContext context) {
+//     return Container(
+//       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+//       decoration: BoxDecoration(
+//         color: Colors.white.withOpacity(0.92),
+//         borderRadius: BorderRadius.circular(18),
+//         border: Border.all(color: Colors.black.withOpacity(0.06)),
+//         boxShadow: [
+//           BoxShadow(
+//             blurRadius: 20,
+//             offset: const Offset(0, 8),
+//             color: Colors.black.withOpacity(0.10),
+//           ),
+//         ],
+//       ),
+//       child: Row(
+//         children: [
+//           InkWell(
+//             onTap: onDrawer,
+//             child: Image.asset(AppImages.drawer, height: 26, width: 26),
+//           ),
+//           const Spacer(),
+//
+//           GestureDetector(
+//             onTap: onToggle,
+//             child: Obx(() {
+//               final isOnline = statusController.isOnline.value;
+//               final isLoading = statusController.isLoading.value;
+//
+//               return AnimatedContainer(
+//                 duration: const Duration(milliseconds: 220),
+//                 curve: Curves.easeOut,
+//                 padding: const EdgeInsets.symmetric(
+//                   horizontal: 10,
+//                   vertical: 6,
+//                 ),
+//                 decoration: BoxDecoration(
+//                   color: isOnline ? AppColors.nBlue : Colors.black,
+//                   borderRadius: BorderRadius.circular(30),
+//                 ),
+//                 child: Row(
+//                   mainAxisSize: MainAxisSize.min,
+//                   children: [
+//                     if (isLoading) ...[
+//                       const SizedBox(
+//                         height: 16,
+//                         width: 16,
+//                         child: CircularProgressIndicator(
+//                           strokeWidth: 2,
+//                           color: Colors.white,
+//                         ),
+//                       ),
+//                       const SizedBox(width: 10),
+//                     ],
+//                     if (isOnline) ...[
+//                       const Text(
+//                         "Online",
+//                         style: TextStyle(color: Colors.white),
+//                       ),
+//                       const SizedBox(width: 10),
+//                       Container(
+//                         padding: const EdgeInsets.all(5),
+//                         decoration: const BoxDecoration(
+//                           color: Colors.white,
+//                           shape: BoxShape.circle,
+//                         ),
+//                         child: Image.asset(
+//                           AppImages.offlineCar,
+//                           width: 18,
+//                           height: 18,
+//                           color: AppColors.nBlue,
+//                         ),
+//                       ),
+//                     ] else ...[
+//                       Container(
+//                         padding: const EdgeInsets.all(5),
+//                         decoration: const BoxDecoration(
+//                           color: Colors.white,
+//                           shape: BoxShape.circle,
+//                         ),
+//                         child: Image.asset(
+//                           AppImages.offlineCar,
+//                           width: 18,
+//                           height: 18,
+//                           color: Colors.black,
+//                         ),
+//                       ),
+//                       const SizedBox(width: 10),
+//                       const Text(
+//                         "Offline",
+//                         style: TextStyle(color: Colors.white),
+//                       ),
+//                     ],
+//                   ],
+//                 ),
+//               );
+//             }),
+//           ),
+//
+//           const Spacer(),
+//           const SizedBox(width: 10),
+//         ],
+//       ),
+//     );
+//   }
+// }
+//
+// class DriverBottomSheet extends StatefulWidget {
+//   const DriverBottomSheet({
+//     super.key,
+//     required this.statusController,
+//     required this.bookingController,
+//     required this.remainingSeconds,
+//     required this.safeToDouble,
+//     required this.safeToInt,
+//     required this.formatDuration,
+//     required this.formatDistance,
+//   });
+//
+//   final DriverStatusController statusController;
+//   final BookingRequestController bookingController;
+//
+//   final int remainingSeconds;
+//
+//   final double Function(dynamic) safeToDouble;
+//   final int Function(dynamic) safeToInt;
+//   final String Function(int) formatDuration;
+//   final String Function(double) formatDistance;
+//
+//   @override
+//   State<DriverBottomSheet> createState() => _DriverBottomSheetState();
+// }
+//
+// class _DriverBottomSheetState extends State<DriverBottomSheet> {
+//   final DraggableScrollableController _sheetCtrl =
+//       DraggableScrollableController();
+//
+//   // Ã¢Å“â€¦ Uber-like snap points (collapsed, mid, full)
+//   static const List<double> _snaps = [0.22, 0.65, 0.98];
+//
+//   double _currentSize = _snaps[1];
+//   bool _isSnapping = false;
+//   Timer? _snapDebounce;
+//
+//   double _nearestSnap(double size) {
+//     double best = _snaps.first;
+//     double bestDist = (size - best).abs();
+//     for (final s in _snaps) {
+//       final d = (size - s).abs();
+//       if (d < bestDist) {
+//         bestDist = d;
+//         best = s;
+//       }
+//     }
+//     return best;
+//   }
+//
+//   void _scheduleSnap() {
+//     _snapDebounce?.cancel();
+//     _snapDebounce = Timer(const Duration(milliseconds: 120), () async {
+//       if (!mounted) return;
+//       if (_isSnapping) return;
+//
+//       final target = _nearestSnap(_currentSize);
+//
+//       // close enough -> ignore
+//       if ((_currentSize - target).abs() < 0.03) return;
+//
+//       _isSnapping = true;
+//       try {
+//         await _sheetCtrl.animateTo(
+//           target,
+//           duration: const Duration(milliseconds: 260),
+//           curve: Curves.easeOutCubic,
+//         );
+//       } catch (_) {
+//         // ignore
+//       } finally {
+//         _isSnapping = false;
+//       }
+//     });
+//   }
+//
+//   @override
+//   void dispose() {
+//     _snapDebounce?.cancel();
+//     super.dispose();
+//   }
+//
+//   Color getTextColor({Color color = Colors.black}) =>
+//       widget.statusController.isOnline.value ? color : Colors.black;
+//
+//   @override
+//   Widget build(BuildContext context) {
+//     // Ã¢Å“â€¦ IMPORTANT: read serviceType inside Obx, otherwise it wonÃ¢â‚¬â„¢t update instantly
+//     return Obx(() {
+//       final serviceType = widget.statusController.serviceType.value;
+//
+//       return NotificationListener<DraggableScrollableNotification>(
+//         onNotification: (n) {
+//           _currentSize = n.extent;
+//
+//           // Ã¢Å“â€¦ Snap when user stops dragging (debounced)
+//           if (n.extent <= _snaps.last && n.extent >= _snaps.first) {
+//             _scheduleSnap();
+//           }
+//           return false;
+//         },
+//         child: DraggableScrollableSheet(
+//           controller: _sheetCtrl,
+//           initialChildSize: _snaps[1],
+//           minChildSize: _snaps[0],
+//           maxChildSize: _snaps[2],
+//           snap: false, // manual snap for consistent Uber feel
+//           builder: (context, scrollController) {
+//             return Container(
+//               decoration: BoxDecoration(
+//                 color: Colors.white,
+//                 borderRadius: const BorderRadius.vertical(
+//                   top: Radius.circular(22),
+//                 ),
+//                 boxShadow: [
+//                   BoxShadow(
+//                     blurRadius: 26,
+//                     offset: const Offset(0, -10),
+//                     color: Colors.black.withOpacity(0.10),
+//                   ),
+//                 ],
+//               ),
+//               child: RefreshIndicator(
+//                 onRefresh: () async {
+//                   await widget.statusController.weeklyChallenges();
+//                   if (serviceType == 'Car') {
+//                     await widget.statusController.todayActivity();
+//                   } else {
+//                     await widget.statusController.todayPackageActivity();
+//                   }
+//                 },
+//                 child: ListView(
+//                   controller: scrollController,
+//                   physics: const AlwaysScrollableScrollPhysics(
+//                     parent: BouncingScrollPhysics(),
+//                   ),
+//                   children: [
+//                     // drag handle only
+//                     Center(
+//                       child: Container(
+//                         width: 44,
+//                         height: 4,
+//                         margin: const EdgeInsets.only(top: 10),
+//                         decoration: BoxDecoration(
+//                           color: Colors.grey[350],
+//                           borderRadius: BorderRadius.circular(10),
+//                         ),
+//                       ),
+//                     ),
+//                     const SizedBox(height: 10),
+//
+//                     // =========================
+//                     // Ã¢Å“â€¦ Booking Request Area
+//                     // =========================
+//                     if (serviceType == 'Car') ...[
+//                       Center(
+//                         child: CustomTextfield.textWithStyles700(
+//                           'Hoppr Car',
+//                           color: AppColors.commonBlack.withOpacity(0.55),
+//                         ),
+//                       ),
+//                       const SizedBox(height: 10),
+//                       Obx(() {
+//                         final data =
+//                             widget.bookingController.bookingRequestData.value;
+//                         if (data == null) return const SizedBox.shrink();
+//
+//                         return Padding(
+//                           padding: const EdgeInsets.symmetric(horizontal: 12),
+//                           child: Column(
+//                             children: [
+//                               Row(
+//                                 mainAxisAlignment: MainAxisAlignment.center,
+//                                 children: [
+//                                   Container(
+//                                     padding: const EdgeInsets.symmetric(
+//                                       horizontal: 10,
+//                                       vertical: 5,
+//                                     ),
+//                                     decoration: BoxDecoration(
+//                                       color: AppColors.red,
+//                                       borderRadius: BorderRadius.circular(6),
+//                                     ),
+//                                     child: CustomTextfield.textWithStyles600(
+//                                       color: AppColors.commonWhite,
+//                                       '${widget.remainingSeconds}s',
+//                                     ),
+//                                   ),
+//                                   const SizedBox(width: 14),
+//                                   const Text(
+//                                     "Respond within 15 seconds",
+//                                     style: TextStyle(
+//                                       fontWeight: FontWeight.w700,
+//                                     ),
+//                                   ),
+//                                 ],
+//                               ),
+//                               const SizedBox(height: 10),
+//                               _CarBookingCardUI(
+//                                 data: data,
+//                                 statusController: widget.statusController,
+//                                 bookingController: widget.bookingController,
+//                                 safeToDouble: widget.safeToDouble,
+//                                 safeToInt: widget.safeToInt,
+//                                 formatDuration: widget.formatDuration,
+//                                 formatDistance: widget.formatDistance,
+//                               ),
+//                             ],
+//                           ),
+//                         );
+//                       }),
+//                     ] else ...[
+//                       Center(
+//                         child: Opacity(
+//                           opacity: 0.65,
+//                           child: Image.asset(
+//                             AppImages.hopprPackage,
+//                             height: 26,
+//                           ),
+//                         ),
+//                       ),
+//                       const SizedBox(height: 10),
+//                       Obx(() {
+//                         final data =
+//                             widget.bookingController.bookingRequestData.value;
+//                         if (data == null) return const SizedBox.shrink();
+//
+//                         return Padding(
+//                           padding: const EdgeInsets.symmetric(horizontal: 12),
+//                           child: Column(
+//                             children: [
+//                               Row(
+//                                 mainAxisAlignment: MainAxisAlignment.center,
+//                                 children: [
+//                                   Container(
+//                                     padding: const EdgeInsets.symmetric(
+//                                       horizontal: 10,
+//                                       vertical: 5,
+//                                     ),
+//                                     decoration: BoxDecoration(
+//                                       color: AppColors.red,
+//                                       borderRadius: BorderRadius.circular(6),
+//                                     ),
+//                                     child: CustomTextfield.textWithStyles600(
+//                                       color: AppColors.commonWhite,
+//                                       '${widget.remainingSeconds}s',
+//                                     ),
+//                                   ),
+//                                   const SizedBox(width: 14),
+//                                   const Text(
+//                                     "Respond within 15 seconds",
+//                                     style: TextStyle(
+//                                       fontWeight: FontWeight.w700,
+//                                     ),
+//                                   ),
+//                                 ],
+//                               ),
+//                               const SizedBox(height: 10),
+//                               _ParcelBookingCardUI(
+//                                 data: data,
+//                                 statusController: widget.statusController,
+//                                 bookingController: widget.bookingController,
+//                                 safeToDouble: widget.safeToDouble,
+//                                 safeToInt: widget.safeToInt,
+//                                 formatDuration: widget.formatDuration,
+//                                 formatDistance: widget.formatDistance,
+//                               ),
+//                             ],
+//                           ),
+//                         );
+//                       }),
+//                     ],
+//
+//                     // =========================
+//                     // Ã¢Å“â€¦ Offline banner (keep)
+//                     // =========================
+//                     Obx(() {
+//                       if (widget.statusController.isOnline.value)
+//                         return const SizedBox(height: 6);
+//                       return Container(
+//                         height: 54,
+//                         color: AppColors.commonBlack,
+//                         child: Row(
+//                           mainAxisAlignment: MainAxisAlignment.center,
+//                           children: [
+//                             Image.asset(
+//                               AppImages.graph,
+//                               color: AppColors.commonWhite,
+//                               height: 20,
+//                             ),
+//                             const SizedBox(width: 10),
+//                             CustomTextfield.textWithStyles600(
+//                               fontSize: 13,
+//                               color: AppColors.commonWhite,
+//                               'You are Offline - Go Online to get requests',
+//                             ),
+//                           ],
+//                         ),
+//                       );
+//                     }),
+//
+//                     const SizedBox(height: 18),
+//
+//                     // =========================
+//                     // Ã¢Å“â€¦ Weekly + Today (FULL)
+//                     // =========================
+//                     Padding(
+//                       padding: const EdgeInsets.symmetric(horizontal: 17),
+//                       child: Column(
+//                         crossAxisAlignment: CrossAxisAlignment.start,
+//                         children: [
+//                           CustomTextfield.textWithStyles700(
+//                             'Weekly Challenges',
+//                             fontSize: 16,
+//                             color: getTextColor(),
+//                           ),
+//                           const SizedBox(height: 10),
+//
+//                           // Ã¢Å“â€¦ Weekly widget (FULL)
+//                           Container(
+//                             decoration: BoxDecoration(
+//                               borderRadius: BorderRadius.circular(12),
+//                               border: Border.all(
+//                                 color: AppColors.commonBlack.withOpacity(0.08),
+//                               ),
+//                             ),
+//                             child: Padding(
+//                               padding: const EdgeInsets.symmetric(
+//                                 horizontal: 15,
+//                                 vertical: 20,
+//                               ),
+//                               child: Obx(() {
+//                                 final weeklyData =
+//                                     widget
+//                                         .statusController
+//                                         .weeklyStatusData
+//                                         .value;
+//
+//                                 return Row(
+//                                   crossAxisAlignment: CrossAxisAlignment.start,
+//                                   children: [
+//                                     Expanded(
+//                                       child: Column(
+//                                         crossAxisAlignment:
+//                                             CrossAxisAlignment.start,
+//                                         children: [
+//                                           CustomTextfield.textWithStylesSmall(
+//                                             'Ends on Monday',
+//                                             colors: AppColors.grey,
+//                                             fontWeight: FontWeight.w500,
+//                                           ),
+//                                           const SizedBox(height: 5),
+//                                           CustomTextfield.textWithStyles600(
+//                                             'Complete ${weeklyData?.goal.toString() ?? '0'} trips and get ${weeklyData?.reward.toString() ?? '0'} extra',
+//                                             fontSize: 17,
+//                                           ),
+//                                           const SizedBox(height: 5),
+//                                           CustomTextfield.textWithStylesSmall(
+//                                             colors: getTextColor(
+//                                               color: AppColors.drkGreen,
+//                                             ),
+//                                             '${weeklyData?.totalTrips.toString() ?? '0'} trips done out of 20',
+//                                             fontWeight: FontWeight.w500,
+//                                           ),
+//                                         ],
+//                                       ),
+//                                     ),
+//                                     const SizedBox(width: 15),
+//                                     CircularPercentIndicator(
+//                                       radius: 45.0,
+//                                       lineWidth: 10.0,
+//                                       animation: true,
+//                                       percent: ((weeklyData?.progressPercent ??
+//                                                   0) /
+//                                               100)
+//                                           .clamp(0.0, 1.0),
+//                                       center: Text(
+//                                         "${weeklyData?.progressPercent.toString() ?? '0'}%",
+//                                         style: const TextStyle(
+//                                           fontWeight: FontWeight.w600,
+//                                         ),
+//                                       ),
+//                                       circularStrokeCap:
+//                                           CircularStrokeCap.round,
+//                                       backgroundColor: AppColors.drkGreen
+//                                           .withOpacity(0.1),
+//                                       progressColor: getTextColor(
+//                                         color: AppColors.drkGreen,
+//                                       ),
+//                                     ),
+//                                   ],
+//                                 );
+//                               }),
+//                             ),
+//                           ),
+//
+//                           const SizedBox(height: 18),
+//
+//                           // Ã¢Å“â€¦ Today Activity (FULL)
+//                           CustomTextfield.textWithStyles700(
+//                             "Today's Activity",
+//                             fontSize: 16,
+//                           ),
+//                           const SizedBox(height: 10),
+//
+//                           if (serviceType == 'Car')
+//                             _TodayActivityCar(
+//                               statusController: widget.statusController,
+//                             )
+//                           else
+//                             _TodayActivityParcel(
+//                               statusController: widget.statusController,
+//                             ),
+//
+//                           const SizedBox(height: 18),
+//                         ],
+//                       ),
+//                     ),
+//                   ],
+//                 ),
+//               ),
+//             );
+//           },
+//         ),
+//       );
+//     });
+//   }
+// }
+//
+// /// ==========================================================
+// /// Ã¢Å“â€¦ CAR Booking Card UI (your UI, optimized)
+// /// ==========================================================
+// class _CarBookingCardUI extends StatelessWidget {
+//   const _CarBookingCardUI({
+//     required this.data,
+//     required this.statusController,
+//     required this.bookingController,
+//     required this.safeToDouble,
+//     required this.safeToInt,
+//     required this.formatDuration,
+//     required this.formatDistance,
+//   });
+//
+//   final Map<String, dynamic> data;
+//   final DriverStatusController statusController;
+//   final BookingRequestController bookingController;
+//
+//   final double Function(dynamic) safeToDouble;
+//   final int Function(dynamic) safeToInt;
+//   final String Function(int) formatDuration;
+//   final String Function(double) formatDistance;
+//
+//   @override
+//   Widget build(BuildContext context) {
+//     return Card(
+//       elevation: 3,
+//       child: Container(
+//         decoration: BoxDecoration(
+//           color: AppColors.commonWhite,
+//           borderRadius: BorderRadius.circular(10),
+//         ),
+//         child: Column(
+//           children: [
+//             // header
+//             Container(
+//               width: double.infinity,
+//               height: 54,
+//               decoration: BoxDecoration(
+//                 borderRadius: const BorderRadius.only(
+//                   topLeft: Radius.circular(10),
+//                   topRight: Radius.circular(10),
+//                 ),
+//                 color: AppColors.nBlue,
+//               ),
+//               child: Padding(
+//                 padding: const EdgeInsets.symmetric(horizontal: 15),
+//                 child: Row(
+//                   children: [
+//                     Image.asset(AppImages.notification, height: 25, width: 25),
+//                     const SizedBox(width: 10),
+//                     CustomTextfield.textWithStyles600(
+//                       (data['rideType'] ?? '').toString().toLowerCase() == 'bike'
+//                           ? 'New Package Request'
+//                           : 'New Ride Request',
+//                       color: AppColors.commonWhite,
+//                     ),
+//                     const Spacer(),
+//                     CustomTextfield.textWithImage(
+//                       imageColors: AppColors.commonWhite,
+//                       text: '${data['estimatedPrice'] ?? ''}',
+//                       imagePath: AppImages.bCurrency,
+//                       colors: AppColors.commonWhite,
+//                       fontWeight: FontWeight.w700,
+//                     ),
+//                   ],
+//                 ),
+//               ),
+//             ),
+//
+//             // addresses
+//             Padding(
+//               padding: const EdgeInsets.all(8.0),
+//               child: Column(
+//                 children: [
+//                   Row(
+//                     children: [
+//                       const Icon(Icons.circle, color: Colors.green, size: 12),
+//                       const SizedBox(width: 8),
+//                       Expanded(
+//                         child: Text(
+//                           data['pickupAddress'] ?? '',
+//                           maxLines: 2,
+//                           overflow: TextOverflow.ellipsis,
+//                         ),
+//                       ),
+//                     ],
+//                   ),
+//                   const SizedBox(height: 8),
+//                   Row(
+//                     children: [
+//                       const Icon(Icons.circle, color: Colors.red, size: 12),
+//                       const SizedBox(width: 8),
+//                       Expanded(
+//                         child: Text(
+//                           data['dropAddress'] ?? '',
+//                           maxLines: 2,
+//                           overflow: TextOverflow.ellipsis,
+//                         ),
+//                       ),
+//                     ],
+//                   ),
+//                 ],
+//               ),
+//             ),
+//
+//             Padding(
+//               padding: const EdgeInsets.symmetric(horizontal: 15),
+//               child: Divider(color: AppColors.commonBlack.withOpacity(0.1)),
+//             ),
+//
+//             // duration + distance
+//             Padding(
+//               padding: const EdgeInsets.symmetric(horizontal: 30),
+//               child: Row(
+//                 mainAxisAlignment: MainAxisAlignment.spaceAround,
+//                 children: [
+//                   Row(
+//                     children: [
+//                       Image.asset(AppImages.time, height: 20, width: 20),
+//                       const SizedBox(width: 10),
+//                       Text(
+//                         formatDuration(safeToInt(data['estimateDuration'])),
+//                         style: const TextStyle(fontWeight: FontWeight.w500),
+//                       ),
+//                     ],
+//                   ),
+//                   SizedBox(
+//                     height: 40,
+//                     child: VerticalDivider(
+//                       color: AppColors.commonBlack.withOpacity(0.1),
+//                     ),
+//                   ),
+//                   Row(
+//                     children: [
+//                       Image.asset(AppImages.distance, height: 20, width: 20),
+//                       const SizedBox(width: 10),
+//                       Text(
+//                         formatDistance(safeToDouble(data['estimatedDistance'])),
+//                         style: const TextStyle(fontWeight: FontWeight.w500),
+//                       ),
+//                     ],
+//                   ),
+//                 ],
+//               ),
+//             ),
+//
+//             Padding(
+//               padding: const EdgeInsets.symmetric(horizontal: 15),
+//               child: Divider(color: AppColors.commonBlack.withOpacity(0.1)),
+//             ),
+//
+//             // buttons
+//             Padding(
+//               padding: const EdgeInsets.symmetric(
+//                 horizontal: 8.0,
+//                 vertical: 10,
+//               ),
+//               child: Row(
+//                 children: [
+//                   // DECLINE
+//                   Expanded(
+//                     child: Buttons.button(
+//                       borderRadius: 10,
+//                       buttonColor: AppColors.red,
+//                       onTap:
+//                           statusController.isLoading.value
+//                               ? null
+//                               : () {
+//                                 final id = data['bookingId']?.toString();
+//                                 if (id != null) {
+//                                   bookingController.markHandled(id);
+//                                 } else {
+//                                   bookingController.clear();
+//                                 }
+//                               },
+//                       text: const Text('Decline'),
+//                     ),
+//                   ),
+//                   const SizedBox(width: 20),
+//
+//                   // ACCEPT
+//                   Expanded(
+//                     child: Buttons.button(
+//                       borderRadius: 10,
+//                       buttonColor: AppColors.drkGreen,
+//                       onTap:
+//                           statusController.isLoading.value
+//                               ? null
+//                               : () async {
+//                                 try {
+//                                   final bookingId = data['bookingId'];
+//
+//                                   final pickupAddress =
+//                                       data['pickupAddress'] ?? '';
+//                                   final dropAddress = data['dropAddress'] ?? '';
+//
+//                                   final pickup = LatLng(
+//                                     (data['pickupLocation']['latitude'] as num)
+//                                         .toDouble(),
+//                                     (data['pickupLocation']['longitude'] as num)
+//                                         .toDouble(),
+//                                   );
+//
+//                                   // driver current location
+//                                   // (keep as-is; your controller already handles)
+//                                   await statusController.bookingAccept(
+//                                     pickupLocationAddress: pickupAddress,
+//                                     dropLocationAddress: dropAddress,
+//                                     context,
+//                                     bookingId: bookingId,
+//                                     status: 'ACCEPT',
+//                                     pickupLocation: pickup,
+//                                     driverLocation:
+//                                         pickup, // NOTE: you can pass driver actual LatLng if you have it here
+//                                   );
+//
+//                                   bookingController.markHandled(
+//                                     bookingId.toString(),
+//                                   );
+//                                 } catch (e) {
+//                                   bookingController.clear();
+//                                   CommonLogger.log.e(
+//                                     "Booking accept failed: $e",
+//                                   );
+//                                 }
+//                               },
+//                       text:
+//                           statusController.isLoading.value
+//                               ? SizedBox(
+//                                 height: 20,
+//                                 width: 20,
+//                                 child: AppLoader.circularLoader(),
+//                               )
+//                               : const Text('Accept'),
+//                     ),
+//                   ),
+//                 ],
+//               ),
+//             ),
+//           ],
+//         ),
+//       ),
+//     );
+//   }
+// }
+//
+// /// ==========================================================
+// /// Ã¢Å“â€¦ Parcel card - keep same UI (if you want different, modify here)
+// /// ==========================================================
+// class _ParcelBookingCardUI extends StatelessWidget {
+//   const _ParcelBookingCardUI({
+//     required this.data,
+//     required this.statusController,
+//     required this.bookingController,
+//     required this.safeToDouble,
+//     required this.safeToInt,
+//     required this.formatDuration,
+//     required this.formatDistance,
+//   });
+//
+//   final Map<String, dynamic> data;
+//   final DriverStatusController statusController;
+//   final BookingRequestController bookingController;
+//
+//   final double Function(dynamic) safeToDouble;
+//   final int Function(dynamic) safeToInt;
+//   final String Function(int) formatDuration;
+//   final String Function(double) formatDistance;
+//
+//   @override
+//   Widget build(BuildContext context) {
+//     return _CarBookingCardUI(
+//       data: data,
+//       statusController: statusController,
+//       bookingController: bookingController,
+//       safeToDouble: safeToDouble,
+//       safeToInt: safeToInt,
+//       formatDuration: formatDuration,
+//       formatDistance: formatDistance,
+//     );
+//   }
+// }
+//
+// /// ==========================================================
+// /// Ã¢Å“â€¦ Today Activity - CAR
+// /// ==========================================================
+// class _TodayActivityCar extends StatelessWidget {
+//   const _TodayActivityCar({required this.statusController});
+//   final DriverStatusController statusController;
+//
+//   @override
+//   Widget build(BuildContext context) {
+//     return Container(
+//       decoration: BoxDecoration(
+//         borderRadius: BorderRadius.circular(10),
+//         border: Border.all(color: AppColors.commonBlack.withOpacity(0.1)),
+//       ),
+//       child: Padding(
+//         padding: const EdgeInsets.symmetric(horizontal: 25, vertical: 15),
+//         child: Obx(() {
+//           final data = statusController.todayStatusData.value;
+//           return Row(
+//             mainAxisAlignment: MainAxisAlignment.spaceBetween,
+//             children: [
+//               Column(
+//                 children: [
+//                   CustomTextfield.textWithStyles600(
+//                     'Earnings',
+//                     color: AppColors.grey,
+//                   ),
+//                   CustomTextfield.textWithImage(
+//                     text: data?.earnings.toString() ?? '0',
+//                     colors: AppColors.commonBlack,
+//                     fontWeight: FontWeight.w700,
+//                     fontSize: 16,
+//                     imagePath: AppImages.bCurrency,
+//                   ),
+//                 ],
+//               ),
+//               SizedBox(
+//                 height: 50,
+//                 child: VerticalDivider(
+//                   color: AppColors.commonBlack.withOpacity(0.2),
+//                 ),
+//               ),
+//               Column(
+//                 children: [
+//                   CustomTextfield.textWithStyles600(
+//                     'Online',
+//                     color: AppColors.grey,
+//                   ),
+//                   CustomTextfield.textWithImage(
+//                     text: data?.online.toString() ?? '0',
+//                     colors: AppColors.commonBlack,
+//                     fontWeight: FontWeight.w700,
+//                     fontSize: 16,
+//                   ),
+//                 ],
+//               ),
+//               SizedBox(
+//                 height: 50,
+//                 child: VerticalDivider(
+//                   color: AppColors.commonBlack.withOpacity(0.2),
+//                 ),
+//               ),
+//               Column(
+//                 children: [
+//                   CustomTextfield.textWithStyles600(
+//                     'Rides',
+//                     color: AppColors.grey,
+//                   ),
+//                   CustomTextfield.textWithImage(
+//                     text: data?.rides.toString() ?? '0',
+//                     colors: AppColors.commonBlack,
+//                     fontWeight: FontWeight.w700,
+//                     fontSize: 16,
+//                   ),
+//                 ],
+//               ),
+//             ],
+//           );
+//         }),
+//       ),
+//     );
+//   }
+// }
+//
+// /// ==========================================================
+// /// Ã¢Å“â€¦ Today Activity - PARCEL
+// /// ==========================================================
+// class _TodayActivityParcel extends StatelessWidget {
+//   const _TodayActivityParcel({required this.statusController});
+//   final DriverStatusController statusController;
+//
+//   @override
+//   Widget build(BuildContext context) {
+//     return Container(
+//       decoration: BoxDecoration(borderRadius: BorderRadius.circular(10)),
+//       child: Padding(
+//         padding: const EdgeInsets.symmetric(horizontal: 25, vertical: 15),
+//         child: Obx(() {
+//           final data = statusController.parcelBookingData.value;
+//           return Row(
+//             children: [
+//               Expanded(
+//                 flex: 2,
+//                 child: Column(
+//                   children: [
+//                     Container(
+//                       padding: const EdgeInsets.symmetric(
+//                         horizontal: 10,
+//                         vertical: 10,
+//                       ),
+//                       decoration: const BoxDecoration(
+//                         color: Color(0xFFE2FBE9),
+//                         shape: BoxShape.circle,
+//                       ),
+//                       child: Image.asset(
+//                         AppImages.bCurrency,
+//                         height: 17,
+//                         color: const Color(0xff009721),
+//                       ),
+//                     ),
+//                     const SizedBox(height: 5),
+//                     CustomTextfield.textWithImage(
+//                       text: ((data?.earning ?? 0).toDouble()).toStringAsFixed(
+//                         2,
+//                       ),
+//                       colors: AppColors.commonBlack,
+//                       fontWeight: FontWeight.w700,
+//                       fontSize: 15,
+//                       imagePath: AppImages.bCurrency,
+//                     ),
+//                     const SizedBox(height: 5),
+//                     CustomTextfield.textWithStylesSmall(
+//                       'Earnings',
+//                       colors: AppColors.grey,
+//                     ),
+//                   ],
+//                 ),
+//               ),
+//               const Spacer(),
+//               Expanded(
+//                 flex: 1,
+//                 child: Column(
+//                   children: [
+//                     Container(
+//                       padding: const EdgeInsets.symmetric(
+//                         horizontal: 10,
+//                         vertical: 10,
+//                       ),
+//                       decoration: const BoxDecoration(
+//                         color: Color(0XFFDEEAFC),
+//                         shape: BoxShape.circle,
+//                       ),
+//                       child: Image.asset(AppImages.boxLine, height: 17),
+//                     ),
+//                     const SizedBox(height: 5),
+//                     CustomTextfield.textWithImage(
+//                       text: data?.completed.toString() ?? '0',
+//                       colors: AppColors.commonBlack,
+//                       fontWeight: FontWeight.w700,
+//                       fontSize: 16,
+//                     ),
+//                     const SizedBox(height: 5),
+//                     CustomTextfield.textWithStylesSmall(
+//                       'Deliveries',
+//                       colors: AppColors.grey,
+//                       maxLine: 1,
+//                     ),
+//                   ],
+//                 ),
+//               ),
+//               const Spacer(),
+//               Expanded(
+//                 flex: 1,
+//                 child: Column(
+//                   children: [
+//                     Container(
+//                       padding: const EdgeInsets.symmetric(
+//                         horizontal: 10,
+//                         vertical: 10,
+//                       ),
+//                       decoration: BoxDecoration(
+//                         color: AppColors.starColors,
+//                         shape: BoxShape.circle,
+//                       ),
+//                       child: Image.asset(
+//                         AppImages.star,
+//                         height: 17,
+//                         color: const Color(0XFFC18C30),
+//                       ),
+//                     ),
+//                     const SizedBox(height: 5),
+//                     CustomTextfield.textWithImage(
+//                       text: data?.rating.toString() ?? '0',
+//                       colors: AppColors.commonBlack,
+//                       fontWeight: FontWeight.w700,
+//                       fontSize: 16,
+//                     ),
+//                     const SizedBox(height: 5),
+//                     CustomTextfield.textWithStylesSmall(
+//                       'Rating',
+//                       colors: AppColors.grey,
+//                     ),
+//                   ],
+//                 ),
+//               ),
+//             ],
+//           );
+//         }),
+//       ),
+//     );
+//   }
+// }
+//
+//
+

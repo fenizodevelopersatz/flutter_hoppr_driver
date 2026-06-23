@@ -1,0 +1,13 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+      Release build:
+      Keep the same permissions/service declarations as `src/main/AndroidManifest.xml`.
+
+      This app uses a location foreground service for driver tracking when the app is
+      backgrounded. Do NOT remove background location / foreground service permissions
+      here; if you need to change them, do so in `src/main/AndroidManifest.xml` and
+      update Play Console declarations accordingly.
+    -->
+</manifest>

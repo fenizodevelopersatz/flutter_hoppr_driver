@@ -1,0 +1,880 @@
+// lib/Presentation/DriverScreen/screens/verify_rider_screen.dart
+
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:flutter_screenutil/flutter_screenutil.dart';
+import 'package:get/get.dart';
+import 'package:pin_code_fields/pin_code_fields.dart';
+
+import 'package:hopper/Core/Constants/Colors.dart';
+import 'package:hopper/Core/Utility/Buttons.dart';
+import 'package:hopper/Core/Utility/app_loader.dart';
+import 'package:hopper/Core/Utility/images.dart';
+import 'package:hopper/Core/Utility/snackbar.dart';
+import 'package:hopper/Presentation/Authentication/widgets/bottomNavigation.dart';
+import 'package:hopper/Presentation/DriverScreen/controller/driver_status_controller.dart';
+import 'package:hopper/Presentation/DriverScreen/screens/ride_stats_screen.dart';
+
+class VerifyRiderScreen extends StatefulWidget {
+  final String bookingId;
+  final String custName;
+  final String? pickupAddress;
+  final String? dropAddress;
+
+  /// 👉 For shared ride flow, set this to true and we will just `pop(true)`
+  /// instead of navigating to RideStatsScreen.
+  final bool isSharedRide;
+
+  const VerifyRiderScreen({
+    super.key,
+    required this.bookingId,
+    required this.custName,
+    this.pickupAddress,
+    this.dropAddress,
+    this.isSharedRide = false,
+  });
+
+  @override
+  State<VerifyRiderScreen> createState() => _VerifyRiderScreenState();
+}
+
+class _VerifyRiderScreenState extends State<VerifyRiderScreen> {
+  final TextEditingController otp = TextEditingController(text: "");
+  final formKey = GlobalKey<FormState>();
+  final FocusNode otpFocusNode = FocusNode();
+
+  /// ✅ Use GetX controller (same instance everywhere)
+  final DriverStatusController driverStatusController =
+  Get.find<DriverStatusController>();
+
+  String verifyCode = '';
+  String? otpError;
+  bool otpVerified = false;
+  bool _isNavigating = false;
+
+  // "Resend OTP to rider": client cooldown + busy flag mirror the server's
+  // 30s / 5-attempt policy so the button can't be spammed.
+  bool _resending = false;
+  int _resendCooldown = 0;
+  Timer? _resendTimer;
+
+  Color enableColor = AppColors.commonBlack.withOpacity(0.35);
+  late final StreamController<ErrorAnimationType> errorController;
+
+  @override
+  void initState() {
+    super.initState();
+    errorController = StreamController<ErrorAnimationType>.broadcast();
+  }
+
+  @override
+  void dispose() {
+    _resendTimer?.cancel();
+    errorController.close();
+    if (!_isNavigating) {
+      otp.dispose();
+      otpFocusNode.dispose();
+    }
+    super.dispose();
+  }
+
+  /// Driver taps "Resend OTP to rider" when the customer didn't get the PIN.
+  /// Server re-delivers over socket + push + SMS; cooldown/limits are enforced
+  /// server-side, with an immediate client cooldown to prevent spam.
+  Future<void> _onResendTap() async {
+    if (_resending || _resendCooldown > 0) return;
+    setState(() => _resending = true);
+    _startResendCooldown(30);
+    final result = await driverStatusController.resendRideOtp(
+      bookingId: widget.bookingId,
+    );
+    if (!mounted) return;
+    setState(() => _resending = false);
+    if (result.success) {
+      CustomSnackBar.showSuccess(result.message);
+    } else {
+      CustomSnackBar.showError(result.message);
+    }
+  }
+
+  void _startResendCooldown(int seconds) {
+    _resendTimer?.cancel();
+    setState(() => _resendCooldown = seconds);
+    _resendTimer = Timer.periodic(const Duration(seconds: 1), (t) {
+      if (!mounted) {
+        t.cancel();
+        return;
+      }
+      if (_resendCooldown <= 1) {
+        setState(() => _resendCooldown = 0);
+        t.cancel();
+      } else {
+        setState(() => _resendCooldown -= 1);
+      }
+    });
+  }
+
+  Future<void> _onVerifyTap() async {
+    final enteredOtp = otp.text.trim();
+
+    if (enteredOtp.isEmpty) {
+      setState(() {
+        otpError = "Please enter the OTP";
+        enableColor = AppColors.commonBlack.withOpacity(0.35);
+      });
+      errorController.add(ErrorAnimationType.shake);
+      return;
+    } else if (enteredOtp.length != 4) {
+      setState(() {
+        otpError = "OTP must be 4 digits";
+        enableColor = AppColors.commonBlack.withOpacity(0.35);
+      });
+      errorController.add(ErrorAnimationType.shake);
+      return;
+    }
+
+    setState(() => otpError = null);
+
+    // Hide keyboard
+    FocusScope.of(context).unfocus();
+
+    final result = await driverStatusController.otpInsert(
+      context,
+      bookingId: widget.bookingId,
+      otp: enteredOtp,
+    );
+
+    if (!mounted) return;
+
+    if (!result.success) {
+      setState(() {
+        otpError =
+            result.message.trim().isEmpty ? 'Invalid OTP. Please try again.' : result.message;
+        enableColor = AppColors.commonBlack.withOpacity(0.35);
+      });
+      errorController.add(ErrorAnimationType.shake);
+      return;
+    }
+
+    // ✅ OTP success
+    otpVerified = true;
+
+    // Small delay for UI smoothness
+    await Future.delayed(const Duration(milliseconds: 120));
+
+    _isNavigating = true;
+
+    if (widget.isSharedRide) {
+      // 👉 Shared ride flow: just tell previous screen "OTP verified"
+      Get.back<bool>(result: true);
+    } else {
+      // 👉 Normal flow: go to RideStatsScreen (your existing behaviour)
+      Get.offAll(
+        () => RideStatsScreen(
+          pickupAddress: widget.pickupAddress,
+          dropAddress: widget.dropAddress,
+          bookingId: widget.bookingId,
+        ),
+      );
+    }
+  }
+
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: () => FocusScope.of(context).unfocus(),
+      child: Scaffold(
+        resizeToAvoidBottomInset: true,
+        body: SafeArea(
+          child: Obx(() {
+            // Show the spinner ON the Verify button instead of blanking the whole
+            // screen, so the driver keeps seeing the OTP boxes while verifying.
+            final verifying = driverStatusController.isLoading.value;
+
+            return Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: 15,
+                vertical: 20,
+              ),
+              child: Column(
+                children: [
+                  Expanded(
+                    child: SingleChildScrollView(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        spacing: 32,
+                        children: [
+                          // Back button (tap can be wired later if needed)
+                          Container(
+                            decoration: BoxDecoration(
+                              color: AppColors.commonBlack.withOpacity(0.1),
+                              borderRadius: BorderRadius.circular(30),
+                            ),
+                            child: Padding(
+                              padding: const EdgeInsets.all(8.0),
+                              child: Image.asset(
+                                AppImages.backButton,
+                                height: 25,
+                                width: 25,
+                              ),
+                            ),
+                          ),
+
+                          Text(
+                            textAlign: TextAlign.center,
+                            'Enter the ${widget.custName}’s Verification Code',
+                            style: TextStyle(
+                              color: AppColors.commonBlack,
+                              fontSize: 25,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+
+                          // OTP field + error text
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.center,
+                            children: [
+                              Form(
+                                key: formKey,
+                                child: PinCodeTextField(
+                                  errorAnimationController: errorController,
+                                  autoDisposeControllers: false,
+                                  textStyle: TextStyle(
+                                    fontSize: 20,
+                                    color: otpError != null
+                                        ? AppColors.red
+                                        : Colors.black,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                  autoFocus: !otpVerified,
+                                  autoDismissKeyboard: true,
+                                  focusNode: otpFocusNode,
+                                  appContext: context,
+                                  length: 4,
+                                  blinkWhenObscuring: true,
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  animationType: AnimationType.fade,
+                                  controller: otp,
+                                  keyboardType: TextInputType.number,
+                                  enableActiveFill: true,
+                                  cursorColor: Colors.black,
+                                  animationDuration:
+                                  const Duration(milliseconds: 300),
+                                  boxShadows: const [
+                                    BoxShadow(
+                                      offset: Offset(0, 1),
+                                      color: Colors.black12,
+                                      blurRadius: 5,
+                                    ),
+                                  ],
+                                  pinTheme: PinTheme(
+                                    shape: PinCodeFieldShape.box,
+                                    borderRadius: BorderRadius.circular(4.sp),
+                                    fieldHeight: 48.sp,
+                                    fieldWidth: 48.sp,
+                                    selectedColor: otpError != null
+                                        ? AppColors.red
+                                        : AppColors.commonBlack,
+                                    activeColor: otpError != null
+                                        ? AppColors.red
+                                        : AppColors.containerColor,
+                                    activeFillColor: otpError != null
+                                        ? Colors.transparent
+                                        : AppColors.containerColor,
+                                    inactiveColor: otpError != null
+                                        ? AppColors.red
+                                        : AppColors.containerColor,
+                                    selectedFillColor: otpError != null
+                                        ? Colors.transparent
+                                        : AppColors.containerColor,
+                                    inactiveFillColor: otpError != null
+                                        ? Colors.transparent
+                                        : AppColors.containerColor,
+                                    fieldOuterPadding:
+                                    const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                      vertical: 10,
+                                    ),
+                                  ),
+                                  onChanged: (value) {
+                                    setState(() {
+                                      verifyCode = value;
+                                      // Clear error state once user edits again.
+                                      if (otpError != null) otpError = null;
+
+                                      // Full black when OTP complete; muted-but-
+                                      // VISIBLE black (not near-white) otherwise,
+                                      // so the bottom button is always readable.
+                                      enableColor =
+                                          value.trim().length == 4
+                                              ? AppColors.commonBlack
+                                              : AppColors.commonBlack
+                                                  .withOpacity(0.35);
+                                    });
+                                  },
+                                  beforeTextPaste: (text) => true,
+                                ),
+                              ),
+                              if (otpError != null)
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 8),
+                                  child: Text(
+                                    otpError!,
+                                    style: TextStyle(
+                                      color: AppColors.red,
+                                      fontSize: 14,
+                                    ),
+                                    textAlign: TextAlign.center,
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+
+                  // Verify button
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 0),
+                    child: Buttons.button(
+                      borderRadius: 7,
+                      buttonColor: enableColor,
+                      isLoading: verifying,
+                      onTap: verifying
+                          ? null
+                          : () async {
+                              await _onVerifyTap();
+                            },
+                      text: Text('Verify ${widget.custName}'),
+                    ),
+                  ),
+
+                  // "Didn't get the OTP?" — resend to the rider (socket+push+SMS).
+                  Padding(
+                    padding: const EdgeInsets.only(top: 10, bottom: 4),
+                    child: Center(
+                      child: TextButton(
+                        onPressed: (_resending || _resendCooldown > 0)
+                            ? null
+                            : _onResendTap,
+                        child: Text(
+                          _resendCooldown > 0
+                              ? 'Resend OTP to rider in ${_resendCooldown}s'
+                              : (_resending
+                                  ? 'Resending…'
+                                  : "Rider didn't get it? Resend OTP"),
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                            color: (_resending || _resendCooldown > 0)
+                                ? AppColors.containerColor1
+                                : AppColors.commonBlack,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }),
+        ),
+      ),
+    );
+  }
+}
+
+
+/*
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+
+import 'package:flutter_screenutil/flutter_screenutil.dart';
+import 'package:hopper/Presentation/DriverScreen/controller/driver_status_controller.dart';
+import 'package:hopper/Presentation/DriverScreen/screens/driver_main_screen.dart';
+import 'package:hopper/Presentation/DriverScreen/screens/ride_stats_screen.dart';
+import 'package:hopper/dummy_screen.dart';
+import '../../../Core/Constants/Colors.dart';
+import '../../../Core/Constants/log.dart';
+import '../../../Core/Utility/Buttons.dart';
+import '../../../Core/Utility/app_loader.dart';
+import '../../../Core/Utility/images.dart';
+import '../../Authentication/widgets/bottomNavigation.dart';
+
+import 'package:pin_code_fields/pin_code_fields.dart';
+import 'package:get/get.dart';
+
+class VerifyRiderScreen extends StatefulWidget {
+  final String bookingId;
+  final String custName;
+  final String? pickupAddress;
+  final String? dropAddress;
+  const VerifyRiderScreen({
+    super.key,
+    required this.bookingId,
+    required this.custName,
+    this.pickupAddress,
+    this.dropAddress,
+  });
+
+  @override
+  State<VerifyRiderScreen> createState() => _VerifyRiderScreenState();
+}
+
+class _VerifyRiderScreenState extends State<VerifyRiderScreen> {
+  final TextEditingController otp = TextEditingController(text: "");
+  String verifyCode = '';
+  final formKey = GlobalKey<FormState>();
+  FocusNode otpFocusNode = FocusNode();
+  final DriverStatusController driverStatusController =
+      DriverStatusController();
+  String? otpError;
+  bool isButtonDisabled = false;
+  String email = '';
+  bool otpVerified = false;
+
+  Color enableColor = AppColors.commonBlack.withOpacity(0.35);
+  late StreamController<ErrorAnimationType> errorController;
+
+  @override
+  void initState() {
+    super.initState();
+
+    errorController = StreamController<ErrorAnimationType>.broadcast();
+  }
+
+  bool _isNavigating = false;
+
+  @override
+  void dispose() {
+    if (!_isNavigating) {
+      otp.dispose();
+      otpFocusNode.dispose();
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: () => FocusScope.of(context).unfocus(),
+      child: Scaffold(
+        resizeToAvoidBottomInset: true,
+        body: SafeArea(
+          child: Obx(() {
+            return driverStatusController.isLoading.value
+                ? Center(child: AppLoader.appLoader())
+                : Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 15,
+                    vertical: 20,
+                  ),
+                  child: Column(
+                    children: [
+                      Expanded(
+                        child: SingleChildScrollView(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            spacing: 32,
+                            children: [
+                              Container(
+                                decoration: BoxDecoration(
+                                  color: AppColors.commonBlack.withOpacity(0.1),
+                                  borderRadius: BorderRadius.circular(30),
+                                ),
+                                child: Padding(
+                                  padding: const EdgeInsets.all(8.0),
+                                  child: Image.asset(
+                                    AppImages.backButton,
+                                    height: 25,
+                                    width: 25,
+                                  ),
+                                ),
+                              ),
+
+                              Text(
+                                textAlign: TextAlign.center,
+                                'Enter the ${widget.custName}’s Verification Code ',
+                                style: TextStyle(
+                                  color: AppColors.commonBlack,
+                                  fontSize: 25,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+
+                              */
+/*   Form(
+                                key: formKey,
+                                child: PinCodeTextField(
+                                  autoFocus: true,
+                                  focusNode: otpFocusNode,
+                                  appContext: context,
+
+                                  // pastedTextStyle: TextStyle(
+                                  //   color: Colors.green.shade600,
+                                  //   fontWeight: FontWeight.bold,
+                                  // ),
+                                  length: 4,
+
+                                  // obscureText: true,
+                                  // obscuringCharacter: '*',
+                                  // obscuringWidget: const FlutterLogo(size: 24,),
+                                  blinkWhenObscuring: true,
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  autoDisposeControllers: false,
+                                  animationType: AnimationType.fade,
+
+                                  // validator: (v) {
+                                  //   if (v == null || v.length != 4)
+                                  //     return 'Enter valid 4-digit OTP';
+                                  //   return null;
+                                  // },
+                                  pinTheme: PinTheme(
+                                    shape: PinCodeFieldShape.box,
+                                    borderRadius: BorderRadius.circular(4.sp),
+                                    fieldHeight: 48.sp,
+                                    fieldWidth: 48.sp,
+                                    selectedColor: AppColors.commonBlack,
+                                    activeColor: AppColors.containerColor,
+                                    activeFillColor: AppColors.containerColor,
+                                    inactiveColor: AppColors.containerColor,
+                                    selectedFillColor: AppColors.containerColor,
+                                    fieldOuterPadding: EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                    ),
+                                    inactiveFillColor: AppColors.containerColor,
+                                  ),
+                                  cursorColor: Colors.black,
+                                  animationDuration: const Duration(
+                                    milliseconds: 300,
+                                  ),
+                                  enableActiveFill: true,
+                                  errorAnimationController: errorController,
+                                  controller: otp,
+                                  keyboardType: TextInputType.number,
+                                  boxShadows: const [
+                                    BoxShadow(
+                                      offset: Offset(0, 1),
+                                      color: Colors.black12,
+                                      blurRadius: 5,
+                                    ),
+                                  ],
+                                        // validator: (value) {
+                                  //   if (value == null || value.length != 4) {
+                                  //     return 'Please enter a valid 4-digit OTP';
+                                  //   }
+                                  //   return null;
+                                  // },
+                                  // onCompleted: (value) {},
+                                  // onChanged: (value) {
+                                  //   debugPrint(value);
+                                  //   setState(() {
+                                  //     if (value.length == 4) {
+                                  //       enableColor = Colors.black;
+                                  //       isButtonDisabled = true;
+                                  //     } else {
+                                  //       enableColor = AppColors.commonBlack.withOpacity(0.35);
+                                  //       isButtonDisabled = false;
+                                  //     }
+                                  //   });
+                                  //   verifyCode = value;
+                                  // },
+                                  onChanged: (value) {
+                                    setState(() {
+                                      verifyCode = value;
+
+                                      if (value.isEmpty) {
+                                        otpError = "Please enter the OTP";
+                                        enableColor = AppColors.commonBlack.withOpacity(0.35);
+                                        isButtonDisabled = true;
+                                      } else if (value.length != 4) {
+                                        otpError = "OTP must be 4 digits";
+                                        enableColor = AppColors.commonBlack.withOpacity(0.35);
+                                        isButtonDisabled = true;
+                                      } else {
+                                        otpError = null;
+                                        enableColor = Colors.black;
+                                        isButtonDisabled = false;
+                                      }
+                                    });
+                                  },
+
+                                  beforeTextPaste: (text) {
+                                    return true;
+                                  },
+                                ),
+                              ),*//*
+
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.center,
+                                children: [
+                                  Form(
+                                    key: formKey,
+                                    child: PinCodeTextField(
+                                      errorAnimationController: errorController,
+                                      autoDisposeControllers: false,
+                                      textStyle: TextStyle(
+                                        fontSize: 20,
+                                        color:
+                                            otpError != null
+                                                ? AppColors.red
+                                                : Colors.black,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+
+                                      autoFocus: !otpVerified,
+
+                                      autoDismissKeyboard: true,
+                                      focusNode: otpFocusNode,
+                                      appContext: context,
+                                      length: 4,
+                                      blinkWhenObscuring: true,
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.center,
+
+                                      animationType: AnimationType.fade,
+                                      controller: otp,
+                                      keyboardType: TextInputType.number,
+                                      enableActiveFill: true,
+
+                                      cursorColor: Colors.black,
+                                      animationDuration: const Duration(
+                                        milliseconds: 300,
+                                      ),
+                                      boxShadows: const [
+                                        BoxShadow(
+                                          offset: Offset(0, 1),
+                                          color: Colors.black12,
+                                          blurRadius: 5,
+                                        ),
+                                      ],
+                                      pinTheme: PinTheme(
+                                        shape: PinCodeFieldShape.box,
+                                        borderRadius: BorderRadius.circular(
+                                          4.sp,
+                                        ),
+                                        fieldHeight: 48.sp,
+                                        fieldWidth: 48.sp,
+                                        selectedColor:
+                                            otpError != null
+                                                ? AppColors.red
+                                                : AppColors.commonBlack,
+                                        activeColor:
+                                            otpError != null
+                                                ? AppColors.red
+                                                : AppColors.containerColor,
+                                        activeFillColor:
+                                            otpError != null
+                                                ? Colors.transparent
+                                                : AppColors.containerColor,
+                                        inactiveColor:
+                                            otpError != null
+                                                ? AppColors.red
+                                                : AppColors.containerColor,
+                                        selectedFillColor:
+                                            otpError != null
+                                                ? Colors.transparent
+                                                : AppColors.containerColor,
+                                        inactiveFillColor:
+                                            otpError != null
+                                                ? Colors.transparent
+                                                : AppColors.containerColor,
+                                        fieldOuterPadding:
+                                            const EdgeInsets.symmetric(
+                                              horizontal: 8,
+                                              vertical: 10,
+                                            ),
+                                      ),
+                                      onChanged: (value) {
+                                        setState(() {
+                                          verifyCode = value;
+
+                                          if (value.isEmpty) {
+                                            otpError = "Please enter the OTP";
+                                            enableColor =
+                                                AppColors.containerColor1;
+                                            isButtonDisabled = true;
+                                          } else {
+                                            otpError = null;
+                                            enableColor = Colors.black;
+                                            isButtonDisabled = false;
+                                          }
+                                        });
+                                      },
+                                      beforeTextPaste: (text) {
+                                        return true;
+                                      },
+                                    ),
+                                  ),
+
+                                  // 🔴 Show error directly below the OTP field
+                                  if (otpError != null)
+                                    Padding(
+                                      padding: const EdgeInsets.only(top: 8),
+                                      child: Text(
+                                        otpError!,
+                                        style: TextStyle(
+                                          color: AppColors.red,
+                                          fontSize: 14,
+                                        ),
+                                        textAlign: TextAlign.center,
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      //
+                      // Padding(
+                      //   padding: const EdgeInsets.symmetric(horizontal: 0),
+                      //   child: Buttons.button(
+                      //     borderRadius: 7,
+                      //     buttonColor: enableColor,
+                      //     onTap:
+                      //         isButtonDisabled
+                      //             ? null
+                      //             : () async {
+                      //               if (otp.text.length != 4) {
+                      //                 errorController?.add(
+                      //                   ErrorAnimationType.shake,
+                      //                 );
+                      //                 setState(() {
+                      //                   otpError =
+                      //                       'Please enter a valid 4-digit OTP';
+                      //                   isButtonDisabled = false;
+                      //                 });
+                      //                 return;
+                      //               }
+                      //
+                      //               final enteredOtp = otp.text;
+                      //               await driverStatusController.otpInsert(
+                      //                 context,
+                      //                 bookingId: '574636',
+                      //                 otp: enteredOtp,
+                      //               );
+                      //             },
+                      //     text: Text('Verify Rebecca'),
+                      //   ),
+                      // ),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 0),
+                        child: Buttons.button(
+                          borderRadius: 7,
+                          buttonColor: enableColor,
+
+                          */
+/*                          onTap: () async {
+                            final enteredOtp = otp.text.trim();
+
+                            if (enteredOtp.isEmpty || enteredOtp.length != 4) {
+                              setState(() {
+                                otpError =
+                                    enteredOtp.isEmpty
+                                        ? "Please enter the OTP"
+                                        : "OTP must be 4 digits";
+                              });
+                              return;
+                            }
+
+                            // ✅ 1. Hide keyboard
+                            FocusScope.of(context).unfocus();
+
+                            // ✅ 2. Wait for keyboard to close
+                            await Future.delayed(Duration(milliseconds: 200));
+
+                            // ✅ 3. Insert OTP
+                            final result = await driverStatusController
+                                .otpInsert(
+                                  context,
+                                  bookingId: '574636',
+                                  otp: enteredOtp,
+                                );
+
+                            if (result != null) {
+                              // ✅ 4. Prevent autofocus next time
+                              otpVerified = true;
+
+                              // ✅ 5. Wait for UI to settle
+                              await Future.delayed(Duration(milliseconds: 100));
+
+                              // ✅ 6. Navigate
+                              if (mounted) {
+                                Navigator.pushReplacement(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder: (_) => RideStatsScreen(),
+                                  ),
+                                );
+                              }
+                            }
+                          },*//*
+
+                          onTap: () async {
+                            final enteredOtp = otp.text.trim();
+
+                            if (enteredOtp.isEmpty) {
+                              setState(() {
+                                otpError = "Please enter the OTP";
+                              });
+                              return;
+                            } else if (enteredOtp.length != 4) {
+                              setState(() {
+                                otpError = "OTP must be 4 digits";
+                              });
+                              return;
+                            }
+
+                            setState(() {
+                              otpError = null;
+                            });
+
+                            // await driverStatusController.otpInsert(
+                            //   context,
+                            //   bookingId: '574636',
+                            //   otp: enteredOtp,
+                            // );
+                            final result = await driverStatusController
+                                .otpInsert(
+                                  context,
+                                  bookingId: widget.bookingId,
+                                  otp: enteredOtp,
+                                );
+
+                            if (result != null) {
+                              otpVerified = true;
+
+                              await Future.delayed(Duration(milliseconds: 100));
+
+                              if (mounted) {
+                                Navigator.pushReplacement(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder:
+                                        (_) => RideStatsScreen(
+                                          pickupAddress: widget.pickupAddress,
+                                          dropAddress: widget.dropAddress,
+                                          bookingId: widget.bookingId,
+                                        ),
+                                  ),
+                                );
+                              }
+                            }
+                          },
+                          text: Text('Verify ${widget.custName}'),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+          }),
+        ),
+      ),
+    );
+  }
+}
+*/
