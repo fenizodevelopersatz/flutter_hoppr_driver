@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:hopper/Core/Constants/log.dart';
+import 'package:hopper/Core/Services/socket_logger_util.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 
 class SocketService {
@@ -159,6 +160,7 @@ class SocketService {
     );
 
     _bindCoreEvents();
+    SocketLoggerUtil.setupSocketLogging(_socket!);
     _socket!.connect();
   }
 
@@ -241,6 +243,7 @@ class SocketService {
     );
 
     _bindCoreEvents();
+    SocketLoggerUtil.setupSocketLogging(_socket!);
     _socket!.connect();
   }
 

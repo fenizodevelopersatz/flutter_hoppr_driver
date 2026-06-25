@@ -6,12 +6,15 @@ import 'package:hopper/Core/Utility/empty_state_view.dart';
 import 'package:hopper/Core/Utility/skeleton_loaders.dart';
 import 'package:hopper/Core/Utility/date_time_converter.dart';
 import 'package:hopper/Presentation/Authentication/widgets/textfields.dart';
+import 'package:share_plus/share_plus.dart';
 
 import 'package:get/get.dart';
 import 'package:hopper/Presentation/Drawer/controller/ride_history_controller.dart';
 
 import '../../../Core/Constants/Colors.dart';
 import '../../../Core/Utility/images.dart';
+import '../../../Core/Services/logger_service.dart';
+import 'dev_logs_screen.dart';
 
 class RideAndPackageHistoryScreen extends StatefulWidget {
   const RideAndPackageHistoryScreen({Key? key}) : super(key: key);
@@ -24,6 +27,7 @@ class RideAndPackageHistoryScreen extends StatefulWidget {
 class _RideAndPackageHistoryScreenState
     extends State<RideAndPackageHistoryScreen> {
   final RideHistoryController controller = Get.put(RideHistoryController());
+  final LoggerService _loggerService = LoggerService();
   // bool isExpanded = false; // Track dropdown state
   List<bool> expandedList = [];
   final ScrollController scrollController = ScrollController();
@@ -37,6 +41,28 @@ class _RideAndPackageHistoryScreenState
         _paginationListener();
       }
     });
+  }
+
+  Future<void> _exportCurrentLogs() async {
+    try {
+      final file = await _loggerService.exportLogs();
+      await Share.shareXFiles(
+        [XFile(file.path)],
+        text: 'Hopper Driver - Development Logs',
+      );
+    } catch (e) {
+      _showSnackBar('Failed to export logs: $e', isError: true);
+    }
+  }
+
+  void _showSnackBar(String message, {bool isError = false}) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: isError ? Colors.red : Colors.green,
+        duration: const Duration(seconds: 2),
+      ),
+    );
   }
 
   void _paginationListener() {
@@ -75,6 +101,44 @@ class _RideAndPackageHistoryScreenState
                     fontSize: 20,
                   ),
                   const Spacer(),
+                  GestureDetector(
+                    onTap: _exportCurrentLogs,
+                    child: Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: Colors.blue[100],
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Icon(
+                        Icons.download_outlined,
+                        size: 18,
+                        color: Colors.blue[700],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  GestureDetector(
+                    onTap: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => const DevLogsScreen(),
+                        ),
+                      );
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: Colors.grey[200],
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: const Icon(
+                        Icons.bug_report_outlined,
+                        size: 18,
+                        color: Colors.grey,
+                      ),
+                    ),
+                  ),
                 ],
               ),
             ),

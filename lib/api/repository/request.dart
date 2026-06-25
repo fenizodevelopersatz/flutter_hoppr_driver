@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:hopper/Core/Consents/app_logger.dart';
+import 'package:hopper/Core/Services/logger_service.dart';
+import 'package:hopper/api/interceptors/api_logger_interceptor.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class Request {
@@ -48,6 +50,7 @@ class Request {
         receiveTimeout: const Duration(seconds: 15),
       ),
     );
+    dio.interceptors.add(ApiLoggerInterceptor());
     dio.interceptors.add(
       InterceptorsWrapper(
         onRequest: (RequestOptions options, RequestInterceptorHandler handler) {
@@ -142,6 +145,7 @@ class Request {
     String? token = prefs.getString('token');
 
     Dio dio = Dio();
+    dio.interceptors.add(ApiLoggerInterceptor());
     dio.interceptors.add(
       InterceptorsWrapper(
         onRequest: (RequestOptions options, RequestInterceptorHandler handler) {
@@ -226,6 +230,7 @@ class Request {
 
     Dio dio = Dio();
 
+    dio.interceptors.add(ApiLoggerInterceptor());
     dio.interceptors.add(
       InterceptorsWrapper(
         onRequest: (RequestOptions options, RequestInterceptorHandler handler) {

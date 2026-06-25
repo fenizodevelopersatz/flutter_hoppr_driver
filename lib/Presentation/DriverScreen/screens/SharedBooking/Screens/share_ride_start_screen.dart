@@ -1043,8 +1043,6 @@ class _ShareRideStartScreenState extends State<ShareRideStartScreen>
     });
 
     socketService.on('driver-cancelled', (data) async {
-      if (!Get.isRegistered<DriverMainController>()) return;
-      await Get.find<DriverMainController>().handleDriverCancelled(data);
       if (!mounted || _isDisposing) return;
       final bookingId = data?['bookingId']?.toString();
       if (bookingId == null || bookingId.isEmpty) return;
@@ -1066,8 +1064,6 @@ class _ShareRideStartScreenState extends State<ShareRideStartScreen>
       }
     });
     socketService.on('customer-cancelled', (data) async {
-      if (!Get.isRegistered<DriverMainController>()) return;
-      await Get.find<DriverMainController>().handleCustomerCancelled(data);
       if (!mounted || _isDisposing) return;
       final bookingId = data?['bookingId']?.toString();
       if (bookingId == null || bookingId.isEmpty) return;

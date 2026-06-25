@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'Core/Constants/log.dart';
 import 'Core/Firebase/firebase_service.dart';
 import 'Core/Services/driver_background_location_service.dart';
+import 'Core/Services/logger_service.dart';
 import 'Presentation/DriverScreen/controller/driver_main_controller.dart';
 import 'splash_screen.dart';
 import 'utils/init_Controller.dart';
@@ -25,6 +26,18 @@ Future<void> main() async {
 
   // ✅ Configure (do not start) background tracking service
   await DriverBackgroundLocationService.initialize();
+
+  // ✅ Initialize logging system
+  final loggerService = LoggerService();
+  await loggerService.logDeviceInfo();
+
+  // ✅ Setup error/crash handling
+  FlutterError.onError = (details) {
+    loggerService.logAppCrash(
+      details.exceptionAsString(),
+      details.stack ?? StackTrace.current,
+    );
+  };
 
   // ✅ Firebase init should never crash the app
   var firebaseReady = false;
@@ -45,8 +58,12 @@ Future<void> main() async {
     }
   }
 
-  // ✅ UI first (prevents black screen even if FCM fails)
-  runApp(const MyApp());
+  // ✅ UI first with error zone (prevents black screen even if FCM fails)
+  runZonedGuarded(() {
+    runApp(const MyApp());
+  }, (error, stack) {
+    loggerService.logAppCrash(error.toString(), stack);
+  });
 
   // ✅ Safe style set (non-blocking)
   SystemChrome.setSystemUIOverlayStyle(

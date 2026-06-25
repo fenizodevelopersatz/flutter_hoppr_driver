@@ -26,7 +26,7 @@ fun isReleaseTaskRequested(): Boolean {
 android {
     namespace = "com.hopper.hopper"
     compileSdk = flutter.compileSdkVersion
-    ndkVersion = "27.0.12077973"
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "com.hopper.hopper"

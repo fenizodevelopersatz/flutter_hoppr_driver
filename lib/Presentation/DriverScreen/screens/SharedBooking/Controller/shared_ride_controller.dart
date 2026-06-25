@@ -278,6 +278,29 @@ class SharedRideController extends GetxController {
     );
   }
 
+  /// Removes a rider from the pool (e.g., due to cancellation).
+  /// Returns the name of the removed rider, or null if not found.
+  String? removeRider(String bookingId) {
+    final idx = riders.indexWhere((r) => r.bookingId == bookingId);
+    if (idx == -1) return null;
+
+    final removedRider = riders.removeAt(idx);
+    riders.refresh();
+
+    logManager.logRider(
+      action: 'RIDER_REMOVED',
+      bookingId: bookingId,
+      riderData: {
+        'name': removedRider.name,
+        'reason': 'Cancelled',
+        'remainingRiders': riders.length,
+      },
+    );
+
+    recomputeNextTarget();
+    return removedRider.name;
+  }
+
   void setActiveTarget(String bookingId, SharedRiderStage stage) {
     final idx = riders.indexWhere((r) => r.bookingId == bookingId);
     if (idx == -1) return;
